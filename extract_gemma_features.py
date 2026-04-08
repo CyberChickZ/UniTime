@@ -22,17 +22,25 @@ Usage:
         --num_frames 32 \\
         --gpu 0
 """
+# IMPORTANT: import torch BEFORE decord. On dgxh-2 (NVIDIA driver 590.48.01,
+# CUDA 13.1 user-space) `import decord` (0.6.0) before torch can pre-init CUDA
+# state in a way that segfaults during deepspeed's auto-detect a few imports
+# later. Order: faulthandler → torch → everything else.
+import faulthandler
+faulthandler.enable()
+
 import argparse
 import os
 
-import decord
-import torch
-from PIL import Image
-from tqdm import tqdm
-from transformers import AutoProcessor
+import torch  # noqa: E402  — must come BEFORE decord
+import decord  # noqa: E402
+from PIL import Image  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+from transformers import AutoProcessor  # noqa: E402
 
-# Will fail if transformers < 4.50; we expect the env to be upgraded to 4.51.3+
-from models.gemma3_vl import Gemma3VLMRForConditionalGeneration
+# Requires transformers >= 4.50 (Gemma 3 added in 4.50.0). Pinned env should
+# already be upgraded to 4.51.3 per docs/research_journal.md 2026-04-08 entry.
+from models.gemma3_vl import Gemma3VLMRForConditionalGeneration  # noqa: E402
 
 
 def parse_args():
