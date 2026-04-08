@@ -60,10 +60,16 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"loading Gemma3 from {args.model_local_path}...")
+    # NOTE: Use sdpa (PyTorch built-in scaled dot product attention) instead of
+    # flash_attention_2. flash-attn 2.7.2 (the version pinned by UniTime upstream)
+    # does not have an op-builder for Gemma3's SigLIP-2 vision tower architecture,
+    # which causes a hard segfault during model load. SDPA works for any
+    # architecture and is fast enough on H100 for offline feature extraction
+    # (28 videos × 32 frames = 896 forward passes).
     model = Gemma3VLMRForConditionalGeneration.from_pretrained(
         args.model_local_path,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_local_path)
 
