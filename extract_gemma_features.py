@@ -22,6 +22,16 @@ Usage:
         --num_frames 32 \\
         --gpu 0
 """
+import os
+# IMPORTANT: must be set BEFORE any transformers/deepspeed import.
+# transformers >= 4.51 eagerly imports deepspeed at the top of
+# transformers/modeling_utils.py (every model load triggers it). deepspeed at
+# import time runs op-builder compatibility checks that read CUDA_HOME — if
+# unset, it raises MissingCUDAException and the whole import chain fails.
+# Setting a default here keeps the script runnable as plain `python ...` (the
+# train.sh path already exports this in shell, so it doesn't need this guard).
+os.environ.setdefault("CUDA_HOME", "/usr/local/apps/cuda/12.1")
+
 # IMPORTANT: import torch BEFORE decord. On dgxh-2 (NVIDIA driver 590.48.01,
 # CUDA 13.1 user-space) `import decord` (0.6.0) before torch can pre-init CUDA
 # state in a way that segfaults during deepspeed's auto-detect a few imports
@@ -30,7 +40,6 @@ import faulthandler
 faulthandler.enable()
 
 import argparse
-import os
 
 import torch  # noqa: E402  — must come BEFORE decord
 import decord  # noqa: E402
