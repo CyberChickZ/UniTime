@@ -54,6 +54,20 @@ register_model(
     model_hf_path="Qwen/Qwen2-VL-7B-Instruct"
 )
 
+#=============================================================
+# gemma3 -----------------------------------------------------
+register_model(
+    model_id="gemma3-4b-it",
+    model_family_id="gemma3",
+    model_hf_path="google/gemma-3-4b-it"
+)
+
+register_model(
+    model_id="gemma3-12b-it",
+    model_family_id="gemma3",
+    model_hf_path="google/gemma-3-12b-it"
+)
+
 # sanity check
 for model_family_id in MODEL_FAMILIES.values():
     assert model_family_id in COLLATORS, f"Collator not found for model family: {model_family_id}"
