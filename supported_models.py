@@ -15,6 +15,15 @@ MODULE_KEYWORDS: Dict[str, Dict[str, List]] = {
         "vision_encoder": ["visual.patch_embed", "visual.rotary_pos_emb", "visual.blocks"],
         "vision_projector": ["visual.merger"],
         "llm": ["model"]
+    },
+    "gemma3": {
+        # Gemma3ForConditionalGeneration submodule layout:
+        #   self.vision_tower            -> SigLIP-2
+        #   self.multi_modal_projector   -> Gemma3MultiModalProjector
+        #   self.language_model          -> Gemma3ForCausalLM (text LLM)
+        "vision_encoder": ["vision_tower"],
+        "vision_projector": ["multi_modal_projector"],
+        "llm": ["language_model"]
     }
 }
 

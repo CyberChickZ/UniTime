@@ -9,3 +9,4 @@ def register_loader(name):
     return register_loader_cls
 
 from .qwen2_vl import Qwen2VLModelLoader
+from .gemma3_vl import Gemma3ModelLoader

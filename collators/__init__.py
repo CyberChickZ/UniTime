@@ -10,4 +10,5 @@ def register_collator(name):
 
 from .qwen2_vl import Qwen2VLDataCollator
 from .qwen_vision_process import process_vision_info
+from .gemma3_vl import Gemma3DataCollator
 # from .qwen2_5_vl import Qwen2_5_VLDataCollator
