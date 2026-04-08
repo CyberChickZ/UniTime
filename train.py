@@ -148,6 +148,7 @@ def train():
         feat_folder=data_args.feat_folder,
         num_clips=data_args.num_clips,
         clip_length=data_args.clip_length,
+        model_family_id=model_args.model_family_id,
     )
     if data_args.eval_data_path:
         val_dataset = VideoCentricDataset(
@@ -158,6 +159,7 @@ def train():
             feat_folder=data_args.feat_folder,
             num_clips=data_args.num_clips,
             clip_length=data_args.clip_length,
+            model_family_id=model_args.model_family_id,
         )
     else:
         val_dataset = None
