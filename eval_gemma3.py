@@ -170,10 +170,13 @@ def main():
                 if query_text != "?":
                     break
 
+            # Extract vid from feature path (video field is None when --video_folder unset)
+            feat_path = instance["message"][0]["content"][0].get("feature") or ""
+            vid_str = os.path.splitext(os.path.basename(feat_path))[0] or "?"
             predictions.append({
                 "qid": instance["qid"],
                 "id_in_dataset": i,
-                "video_id": instance["message"][0]["content"][0].get("video", "?"),
+                "video_id": vid_str,
                 "query": query_text,
                 "duration": instance["duration"],
                 "loss": loss_val,
@@ -200,17 +203,8 @@ def main():
     print("=" * 60)
     print()
 
-    print(f"sample predictions (first {args.num_samples_to_print}):")
-    for p in predictions[: args.num_samples_to_print]:
-        if "error" in p:
-            print(f"  qid={p['qid']} ERROR: {p['error']}")
-            continue
-        print(f"  qid={p['qid']:3d}  video={os.path.basename(p['video_id'])}  query='{p['query']}'  loss={p['loss']:.3f}")
-        print(f"    gold: {p['gold_text']}")
-        print(f"    pred: {p['pred_text']}")
-        print()
-
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    # Save JSON FIRST so a print bug can't lose the data
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         json.dump({
             "summary": {
@@ -222,6 +216,18 @@ def main():
             "predictions": predictions,
         }, f, indent=2, default=str)
     print(f"saved {args.output}")
+    print()
+
+    print(f"sample predictions (first {args.num_samples_to_print}):")
+    for p in predictions[: args.num_samples_to_print]:
+        if "error" in p:
+            print(f"  qid={p['qid']} ERROR: {p['error']}")
+            continue
+        loss_str = f"{p['loss']:.3f}" if p.get('loss') is not None else "?"
+        print(f"  qid={p['qid']:3d}  video={p.get('video_id','?')}  query='{p['query']}'  loss={loss_str}")
+        print(f"    gold: {p['gold_text']}")
+        print(f"    pred: {p['pred_text']}")
+        print()
 
 
 if __name__ == "__main__":
