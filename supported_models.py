@@ -24,6 +24,16 @@ MODULE_KEYWORDS: Dict[str, Dict[str, List]] = {
         "vision_encoder": ["vision_tower"],
         "vision_projector": ["multi_modal_projector"],
         "llm": ["language_model"]
+    },
+    "gemma4": {
+        # Gemma4ForConditionalGeneration → self.model = Gemma4Model, which has
+        #   self.model.vision_tower            -> Gemma4VisionModel
+        #   self.model.embed_vision            -> Gemma4MultimodalEmbedder (projector)
+        #   self.model.language_model          -> Gemma4TextModel (LLM)
+        # The lm_head lives at self.lm_head (not inside self.model).
+        "vision_encoder": ["model.vision_tower"],
+        "vision_projector": ["model.embed_vision"],
+        "llm": ["model.language_model"]
     }
 }
 
@@ -67,6 +77,19 @@ register_model(
     model_family_id="gemma3",
     model_hf_path="google/gemma-3-12b-it"
 )
+
+#=============================================================
+# gemma4 -----------------------------------------------------
+# Only register if the gemma4 collator + loader actually loaded (i.e. the
+# current env has transformers >= 5.0). In the default UniTime env (tf 4.51.3)
+# the gemma4 imports are guarded out and these registrations are skipped, so
+# the sanity-check loop below doesn't fire on missing collators.
+if "gemma4" in COLLATORS and "gemma4" in LOADERS:
+    register_model(
+        model_id="gemma4-e4b-it",
+        model_family_id="gemma4",
+        model_hf_path="google/gemma-4-E4B-it"
+    )
 
 # sanity check
 for model_family_id in MODEL_FAMILIES.values():

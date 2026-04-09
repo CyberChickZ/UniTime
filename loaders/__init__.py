@@ -10,3 +10,9 @@ def register_loader(name):
 
 from .qwen2_vl import Qwen2VLModelLoader
 from .gemma3_vl import Gemma3ModelLoader
+
+# Gemma4 only importable in UniTime-gemma4 env (transformers >= 5.0). Guard it.
+try:
+    from .gemma4_vl import Gemma4ModelLoader  # noqa: F401
+except ImportError:
+    pass
