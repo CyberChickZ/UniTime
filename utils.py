@@ -85,7 +85,7 @@ class NoTextOnlyBatchSampler(Sampler):
 
 
 class TrainerWithCustomSampler(Trainer):
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+    def _get_train_sampler(self, dataset=None) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
 
