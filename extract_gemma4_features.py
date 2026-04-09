@@ -100,17 +100,27 @@ def main():
 
             pil_frames = [Image.fromarray(f) for f in frames]
             inputs = processor.image_processor(pil_frames, return_tensors="pt")
+            # Gemma4 image_processor outputs THREE things (vs Gemma 3's pixel_values only):
+            #   pixel_values: (B, max_patches, vision_hidden) — pre-flattened patches
+            #   image_position_ids: (B, max_patches, 2) — 2D coords, (-1,-1) = padding
+            #   num_soft_tokens_per_image: (B,) — variable mm_tokens per image
+            # The vision tower CRASHES if image_position_ids is None because it does
+            # `(pixel_position_ids == -1).all(dim=-1)` to find padding patches.
             pixel_values = inputs["pixel_values"].to(device, dtype=torch.bfloat16)
+            image_position_ids = inputs["image_position_ids"].to(device)
+            num_soft_tokens = inputs.get("num_soft_tokens_per_image")
 
-            # Gemma4ForConditionalGeneration.get_image_features delegates to
-            # self.model.get_image_features which returns BaseModelOutputWithPooling
-            # whose .pooler_output is the post-projector embedding (the vision-soft
-            # tokens in language space). For older Gemma4 builds the return type
-            # may be a plain tensor — handle both.
-            out = model.get_image_features(pixel_values)
+            out = model.get_image_features(
+                pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
+            )
             features = out.pooler_output if hasattr(out, "pooler_output") else out
             features = features.cpu()
-            # features shape: (nframes, mm_tokens_per_image, text_hidden_size)
+            # features shape: (nframes, num_soft_tokens, text_hidden_size).
+            # num_soft_tokens may differ across frames if Gemma4 picks different
+            # token budgets per image (70/140/280/560/1120). For our use case
+            # (uniform-sampled identical-resolution frames) it should be the same
+            # across all frames in one video.
 
             torch.save(
                 {
