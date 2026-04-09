@@ -527,7 +527,11 @@ class Qwen2VLMRForConditionalGeneration(Qwen2VLForConditionalGeneration):
         return input_ids, model_kwargs
 
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
-from transformers.image_utils import ImageInput, VideoInput
+from transformers.image_utils import ImageInput
+try:
+    from transformers.image_utils import VideoInput
+except ImportError:
+    VideoInput = ImageInput  # VideoInput removed in transformers >= 5.0; alias for type hints only
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.models.qwen2_vl.processing_qwen2_vl import Qwen2VLProcessorKwargs, Qwen2VLProcessor
