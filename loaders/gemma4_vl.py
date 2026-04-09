@@ -19,23 +19,15 @@ class Gemma4ModelLoader(BaseModelLoader):
                     self.model_finetune_path,
                     **self.loading_kwargs,
                 )
-        # Disable Per-Layer Embeddings (PLE). Gemma 4's PLE requires input_ids
-        # for a compact per-layer token lookup. Our UniTime wrapper passes
-        # input_ids=None + inputs_embeds (pre-merged features), which makes PLE
-        # fall back to broadcasting full embeddings across all 42 layers → 320 GB
-        # OOM on 80 GB H100. Setting hidden_size_per_layer_input=0 makes
-        # Gemma4Model skip PLE entirely (per_layer_inputs=None). Quality trade-off
-        # is small for LoRA finetuning with pre-extracted features.
-        if hasattr(model.config, "text_config"):
-            model.config.text_config.hidden_size_per_layer_input = 0
-        if hasattr(model, "model") and hasattr(model.model, "vocab_size_per_layer_input"):
-            model.model.vocab_size_per_layer_input = 0
+        # NOTE: do NOT disable PLE. With the pixel_values path (collator provides
+        # raw images, model runs vision tower itself), PLE works correctly:
+        # input_ids has image placeholder tokens → PLE gives them neutral per-layer
+        # signals → vision tower merges features into inputs_embeds afterwards.
+        # PLE only breaks with the inputs_embeds bypass (input_ids=None), which we
+        # no longer use for Gemma 4.
 
         processor = Gemma4VLMRProcessor.from_pretrained(self.model_local_path)
         tokenizer = processor.tokenizer
         model.tokenizer = tokenizer
         config = AutoConfig.from_pretrained(self.model_local_path)
-        # Also disable PLE in the returned config so train.py doesn't re-enable
-        if hasattr(config, "text_config"):
-            config.text_config.hidden_size_per_layer_input = 0
         return model, tokenizer, processor, config
