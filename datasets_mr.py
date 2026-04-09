@@ -96,7 +96,7 @@ class VideoCentricDataset(Dataset):
         retrieval_segment = [video_start, video_end]
         
         video_path = source.get("video_path", None)
-        if video_path is None:
+        if video_path is None and self.video_folder:
             if 'tacos' in self.video_folder:
                 video_path = os.path.join(self.video_folder,f"{vid}.avi")
             else:
