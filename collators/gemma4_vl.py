@@ -140,12 +140,16 @@ class Gemma4DataCollator(BaseDataCollator):
         # Lock in mm_tokens_per_image from the first feature seen.
         if self._mm_tokens_per_image is None:
             first_feat = feature_inputs_list[0]
-            if first_feat.dim() != 3:
+            if first_feat.dim() == 2:
+                # (T, hidden) — 1 soft token per frame (Gemma 4 image-path pooler_output)
+                self._mm_tokens_per_image = 1
+            elif first_feat.dim() == 3:
+                self._mm_tokens_per_image = int(first_feat.shape[1])
+            else:
                 raise ValueError(
                     f"feature shape {tuple(first_feat.shape)} unexpected; "
-                    f"expected [T, mm_tokens_per_image, hidden_dim]"
+                    f"expected [T, hidden_dim] or [T, mm_tokens_per_image, hidden_dim]"
                 )
-            self._mm_tokens_per_image = int(first_feat.shape[1])
 
         all_input_ids: List[List[int]] = []
         all_labels: List[List[int]] = []
