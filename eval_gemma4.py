@@ -91,7 +91,8 @@ def main():
     print(f"loading base model: {args.base_model}")
     base = Gemma4VLMRForConditionalGeneration.from_pretrained(
         args.base_model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-    ).to(device).eval()
+        device_map="auto",  # use accelerate device placement instead of .to(device) to avoid CUDA init segfault
+    ).eval()
     print(f"loading LoRA: {args.adapter}")
     model = PeftModel.from_pretrained(base, args.adapter).eval()
 
