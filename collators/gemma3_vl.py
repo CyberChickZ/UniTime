@@ -22,6 +22,7 @@ This mirrors `paper_notes/01_unitime.md:55` model-agnostic claim and the
 mr_seg multi-window target construction at
 `UniTime/collators/qwen2_vl.py:91-102`.
 """
+import os
 from typing import Dict, List, Optional, Sequence
 
 import torch
@@ -63,6 +64,10 @@ class Gemma3DataCollator(BaseDataCollator):
         self.mask_question_tokens = mask_question_tokens
 
         # Cache the special token strings + ids once.
+        # Target mode: "timestamp" (default, UniTime original) or "binary" (per-frame 0/1 mask)
+        # Set via env var UNITIME_TARGET_MODE=binary in train script
+        self.target_mode = os.environ.get("UNITIME_TARGET_MODE", "timestamp")
+
         self.boi_token = "<start_of_image>"
         self.eoi_token = "<end_of_image>"
         self.image_token = "<image_soft_token>"
@@ -89,10 +94,19 @@ class Gemma3DataCollator(BaseDataCollator):
 
     def build_user_text(self, sampled_timestamps: List[float], query: str) -> str:
         """Build the text content of the user turn (timestamp+image alternation + query)."""
-        parts = [
-            "This is a sequence interleaved with timestamps and frames. "
-            "Your task is to identify the specific timestamp(s) when the given query appears.\n",
-        ]
+        if self.target_mode == "binary":
+            instruction = (
+                "This is a sequence of video frames with timestamps. "
+                "For the described action, output a binary string where each character "
+                "corresponds to one frame: '1' if the action is happening in that frame, "
+                "'0' if not.\n"
+            )
+        else:
+            instruction = (
+                "This is a sequence interleaved with timestamps and frames. "
+                "Your task is to identify the specific timestamp(s) when the given query appears.\n"
+            )
+        parts = [instruction]
         for t in sampled_timestamps:
             parts.append(f"timestamp: {t} seconds")
             parts.append(self.full_image_sequence)
@@ -102,15 +116,25 @@ class Gemma3DataCollator(BaseDataCollator):
     def build_target_text(
         self, sampled_timestamps: List[float], windows: List[List[float]]
     ) -> str:
-        """mr_seg target = list of sampled timestamps that fall in any window.
+        """Build the target string based on target_mode.
 
-        Mirrors the logic at collators/qwen2_vl.py:91-102.
+        'timestamp' mode (default): list of sampled timestamps inside any window.
+            Mirrors collators/qwen2_vl.py:91-102.
+        'binary' mode: per-frame 0/1 string. Each character = one sampled frame.
+            '1' if the frame is inside ANY window, '0' otherwise.
+            Dense per-frame supervision — much stronger signal than sparse timestamps.
         """
+        if self.target_mode == "binary":
+            return self._build_binary_target(sampled_timestamps, windows)
+        return self._build_timestamp_target(sampled_timestamps, windows)
+
+    def _build_timestamp_target(
+        self, sampled_timestamps: List[float], windows: List[List[float]]
+    ) -> str:
         hit = []
         for window in windows:
             s_idx, e_idx = find_segments(sampled_timestamps, window)
             hit.extend(sampled_timestamps[s_idx : e_idx + 1])
-        # Deduplicate while preserving order, in case windows overlap.
         seen = set()
         ordered = []
         for t in hit:
@@ -120,6 +144,16 @@ class Gemma3DataCollator(BaseDataCollator):
         if not ordered:
             return "(no timestamps)"
         return ", ".join(f"{t} seconds" for t in ordered) + "."
+
+    def _build_binary_target(
+        self, sampled_timestamps: List[float], windows: List[List[float]]
+    ) -> str:
+        """Per-frame binary mask: '1' if timestamp is inside any window, '0' otherwise."""
+        bits = []
+        for t in sampled_timestamps:
+            inside = any(w[0] <= t <= w[1] for w in windows)
+            bits.append("1" if inside else "0")
+        return "".join(bits)
 
     def build_full_prompt(self, user_text: str, target_text: str):
         """Apply Gemma3 chat template structure manually and tokenize.
