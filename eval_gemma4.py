@@ -24,8 +24,20 @@ import argparse
 import json
 import re
 
-import decord
 import torch
+import torch.distributed as dist
+
+# Workaround: torch 2.4.1 + dgxh-2 driver segfaults on Python-level
+# torch.cuda._lazy_init(). Training works because deepspeed inits CUDA through
+# nccl (C-level path). Replicate that here before any model loading.
+for k, v in {"MASTER_ADDR": "localhost", "MASTER_PORT": "29501",
+             "RANK": "0", "WORLD_SIZE": "1", "LOCAL_RANK": "0"}.items():
+    os.environ.setdefault(k, v)
+if not dist.is_initialized():
+    dist.init_process_group(backend="nccl")
+torch.cuda.set_device(0)
+
+import decord
 from PIL import Image
 from peft import PeftModel
 from transformers import AutoConfig, AutoProcessor
