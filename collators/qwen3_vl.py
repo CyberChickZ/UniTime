@@ -1,9 +1,11 @@
 """
 Qwen3-VL data collator for UniTime moment retrieval.
 
-Pixel-values path: loads video frames at each training step via decord,
-builds timestamp-interleaved prompt, uses Qwen3VLProcessor for tokenization.
-Same approach as collators/gemma4_vl.py but adapted to Qwen3-VL's chat template.
+Uses per-frame IMAGE path (not video): each frame is an independent image with
+its own <|image_pad|> tokens, allowing timestamp text between frames.
+Processor handles token expansion automatically.
+
+Requires transformers >= 5.5.0 (UniTime-gemma4 env).
 """
 import os
 from typing import Dict, List, Optional, Sequence
@@ -42,7 +44,6 @@ class Qwen3VLDataCollator(BaseDataCollator):
         self.tokenizer = tokenizer
         self.processor = processor
         self.mask_question_tokens = mask_question_tokens
-        self.im_start_token_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
         self.num_frames = 32
 
     @property
@@ -77,8 +78,9 @@ class Qwen3VLDataCollator(BaseDataCollator):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         all_input_ids = []
         all_labels = []
-        all_pixel_values_videos = []
-        all_video_grid_thw = []
+        all_pixel_values = []
+        all_image_grid_thw = []
+        all_mm_token_type_ids = []
 
         for inst in instances:
             mode = inst["mode"]
@@ -115,43 +117,49 @@ class Qwen3VLDataCollator(BaseDataCollator):
             pil_frames, sampled_timestamps = self._load_frames(video_path)
             target_text = self.build_target_text(sampled_timestamps, windows)
 
-            user_text = (
-                "This is a sequence interleaved with timestamps and frames. "
-                "Your task is to identify the specific timestamp(s) when the given query appears.\n"
-            )
+            user_content = [
+                {"type": "text", "text": "This is a sequence interleaved with timestamps and frames. "
+                 "Your task is to identify the specific timestamp(s) when the given query appears.\n"},
+            ]
             for t in sampled_timestamps:
-                user_text += f"timestamp: {t} seconds "
-                user_text += "<|vision_start|><|video_pad|><|vision_end|>"
-            user_text += f"\nQuery: {query_text}\nAnswer:"
+                user_content.append({"type": "text", "text": f"timestamp: {t} seconds "})
+                user_content.append({"type": "image"})
+            user_content.append({"type": "text", "text": f"\nQuery: {query_text}\nAnswer:"})
 
-            full_text = (
-                f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                f"<|im_start|>user\n{user_text}<|im_end|>\n"
-                f"<|im_start|>assistant\n{target_text}<|im_end|>\n"
-            )
-            prompt_text = (
-                f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                f"<|im_start|>user\n{user_text}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
+            full_messages = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": [{"type": "text", "text": target_text}]},
+            ]
+            prompt_messages = [{"role": "user", "content": user_content}]
 
-            video_inputs = self.processor.video_processor(
-                pil_frames, return_tensors="pt"
+            full_text = self.processor.apply_chat_template(
+                full_messages, tokenize=False, add_generation_prompt=False
+            )
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True
             )
 
-            full_ids = self.tokenizer(full_text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
-            prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
-            prompt_len = prompt_ids.shape[0]
+            full_inputs = self.processor(
+                text=[full_text], images=pil_frames, return_tensors="pt", padding=False
+            )
+            prompt_inputs = self.processor(
+                text=[prompt_text], images=pil_frames, return_tensors="pt", padding=False
+            )
+
+            full_ids = full_inputs["input_ids"][0]
+            prompt_len = prompt_inputs["input_ids"].shape[1]
 
             labels = full_ids.clone()
             labels[:prompt_len] = PAD_IDX
 
             all_input_ids.append(full_ids)
             all_labels.append(labels)
-            if "pixel_values_videos" in video_inputs:
-                all_pixel_values_videos.append(video_inputs["pixel_values_videos"])
-            if "video_grid_thw" in video_inputs:
-                all_video_grid_thw.append(video_inputs["video_grid_thw"])
+            if "pixel_values" in full_inputs:
+                all_pixel_values.append(full_inputs["pixel_values"])
+            if "image_grid_thw" in full_inputs:
+                all_image_grid_thw.append(full_inputs["image_grid_thw"])
+            if "mm_token_type_ids" in full_inputs:
+                all_mm_token_type_ids.append(full_inputs["mm_token_type_ids"][0])
 
         max_len = max(ids.shape[0] for ids in all_input_ids)
         pad_id = self.PAD_TOKEN_ID
@@ -164,13 +172,22 @@ class Qwen3VLDataCollator(BaseDataCollator):
             labels_t[i, : len(lbls)] = lbls
             attn_mask[i, : len(ids)] = 1
 
-        pixel_values_videos = torch.cat(all_pixel_values_videos, dim=0) if all_pixel_values_videos else None
-        video_grid_thw = torch.cat(all_video_grid_thw, dim=0) if all_video_grid_thw else None
+        mm_token_type_ids_t = None
+        if all_mm_token_type_ids:
+            mm_token_type_ids_t = torch.zeros((len(all_mm_token_type_ids), max_len), dtype=torch.long)
+            for i, mm_ids in enumerate(all_mm_token_type_ids):
+                mm_token_type_ids_t[i, : len(mm_ids)] = mm_ids
 
-        return dict(
+        pixel_values = torch.cat(all_pixel_values, dim=0) if all_pixel_values else None
+        image_grid_thw = torch.cat(all_image_grid_thw, dim=0) if all_image_grid_thw else None
+
+        result = dict(
             input_ids=input_ids_t,
             attention_mask=attn_mask,
             labels=labels_t,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
         )
+        if mm_token_type_ids_t is not None:
+            result["mm_token_type_ids"] = mm_token_type_ids_t
+        return result
