@@ -25,6 +25,11 @@ MODULE_KEYWORDS: Dict[str, Dict[str, List]] = {
         "vision_projector": ["multi_modal_projector"],
         "llm": ["language_model"]
     },
+    "qwen3-vl": {
+        "vision_encoder": ["model.visual"],
+        "vision_projector": [],
+        "llm": ["model.language_model"]
+    },
     "gemma4": {
         # Gemma4ForConditionalGeneration → self.model = Gemma4Model, which has
         #   self.model.vision_tower            -> Gemma4VisionModel
@@ -84,6 +89,13 @@ register_model(
 # current env has transformers >= 5.0). In the default UniTime env (tf 4.51.3)
 # the gemma4 imports are guarded out and these registrations are skipped, so
 # the sanity-check loop below doesn't fire on missing collators.
+if "qwen3-vl" in COLLATORS and "qwen3-vl" in LOADERS:
+    register_model(
+        model_id="qwen3-vl-2b-instruct",
+        model_family_id="qwen3-vl",
+        model_hf_path="Qwen/Qwen3-VL-2B-Instruct"
+    )
+
 if "gemma4" in COLLATORS and "gemma4" in LOADERS:
     register_model(
         model_id="gemma4-e4b-it",

@@ -16,3 +16,8 @@ try:
     from .gemma4_vl import Gemma4ModelLoader  # noqa: F401
 except ImportError:
     pass
+
+try:
+    from .qwen3_vl import Qwen3VLModelLoader  # noqa: F401
+except ImportError:
+    pass

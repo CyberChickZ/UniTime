@@ -20,4 +20,9 @@ try:
 except ImportError:
     pass
 
+try:
+    from .qwen3_vl import Qwen3VLDataCollator  # noqa: F401
+except ImportError:
+    pass
+
 # from .qwen2_5_vl import Qwen2_5_VLDataCollator
