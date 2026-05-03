@@ -25,6 +25,12 @@ if 'ego4d' in data_path or 'nlq' in data_path:
 elif 'tacos' in data_path:
     dataset = 'tacos'
     video_type = 'avi'
+elif 'gtea' in data_path:
+    dataset = 'gtea'
+    video_type = 'mp4'
+else:
+    dataset = 'unknown'
+    video_type = 'mp4'
 
 feature_path = f'{feature_root}/{dataset}'
 
