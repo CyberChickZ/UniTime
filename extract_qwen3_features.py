@@ -1,18 +1,11 @@
 """
 Extract Qwen3-VL vision features for UniTime training.
 
-Aligned with UniTime upstream: 2fps dense + token compression.
-Per-frame image processing → get_image_features → resize_feature.
+Pipeline: 2fps dense sampling → vision encoder → token compression → save.
+Output: {feature: [N, H', W', D], frame_idx: [N], sample_fps: float}
+feature.shape[0] == frame_idx.shape[0] always.
 
 Requires UniTime-gemma4 env (transformers >= 5.5.0).
-
-Usage:
-    conda activate UniTime-gemma4
-    python extract_qwen3_features.py \\
-        --video_root /nfs/hpc/dgx2-4/data/TAS_videos/gtea \\
-        --feat_root  /nfs/hpc/dgx2-4/tmp/2026/4/6/feature/Qwen3-VL-2B-Instruct \\
-        --model_local_path /nfs/hpc/share/zhanhaoc/MODLE/Qwen3-VL-2B-Instruct \\
-        --dataset_name gtea --gpu 0
 """
 import os
 os.environ.setdefault("CUDA_HOME", "/usr/local/apps/cuda/12.1")
@@ -37,23 +30,18 @@ FPS = 2.0
 N_TOTAL = 12288
 
 
-def round_by_factor(number, factor):
-    return round(number / factor) * factor
-
-
-def resize_feature(feature, resize_h, resize_w):
-    feature = feature.permute(0, 3, 1, 2)
-    feature_resized = F.interpolate(feature, size=(resize_h, resize_w), mode='bilinear', align_corners=False)
-    feature_resized = feature_resized.permute(0, 2, 3, 1)
-    return feature_resized
+def resize_feature(feature, h, w):
+    return F.interpolate(
+        feature.permute(0, 3, 1, 2), size=(h, w), mode='bilinear', align_corners=False
+    ).permute(0, 2, 3, 1)
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video_root", required=True, type=str)
-    ap.add_argument("--feat_root", required=True, type=str)
-    ap.add_argument("--model_local_path", required=True, type=str)
-    ap.add_argument("--dataset_name", default="gtea", type=str)
+    ap.add_argument("--video_root", required=True)
+    ap.add_argument("--feat_root", required=True)
+    ap.add_argument("--model_local_path", required=True)
+    ap.add_argument("--dataset_name", default="gtea")
     ap.add_argument("--n_total", default=N_TOTAL, type=int)
     ap.add_argument("--part", default=0, type=int)
     ap.add_argument("--num_parts", default=1, type=int)
@@ -65,138 +53,103 @@ def parse_args():
 def main():
     args = parse_args()
     device = torch.device(f"cuda:{args.gpu}")
-
     out_dir = os.path.join(args.feat_root, args.dataset_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"loading Qwen3-VL from {args.model_local_path}...")
     model = Qwen3VLMRForConditionalGeneration.from_pretrained(
-        args.model_local_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        args.model_local_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_local_path)
+    merge_size = processor.image_processor.merge_size
 
-    valid_ext = (".mp4", ".avi", ".mkv", ".mov", ".webm")
-    all_videos = sorted(
-        f for f in os.listdir(args.video_root) if f.lower().endswith(valid_ext)
-    )
-
-    total = len(all_videos)
-    part_size = total // args.num_parts
-    s = args.part * part_size
-    e = (args.part + 1) * part_size if args.part != args.num_parts - 1 else total
-    subset = all_videos[s:e]
-    print(f"part {args.part}/{args.num_parts}: {len(subset)} videos")
+    videos = sorted(f for f in os.listdir(args.video_root)
+                    if f.lower().endswith((".mp4", ".avi", ".mkv", ".mov")))
+    n = len(videos)
+    s = args.part * (n // args.num_parts)
+    e = n if args.part == args.num_parts - 1 else (args.part + 1) * (n // args.num_parts)
+    videos = videos[s:e]
 
     with torch.no_grad():
-        for filename in tqdm(subset):
-            vid = os.path.splitext(filename)[0]
-            video_path = os.path.join(args.video_root, filename)
+        for fname in tqdm(videos):
+            vid = os.path.splitext(fname)[0]
             out_path = os.path.join(out_dir, f"{vid}.pt")
             if os.path.exists(out_path):
                 continue
 
-            try:
-                vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
-            except Exception as ex:
-                print(f"decord open failed for {video_path}: {ex}")
-                continue
-
-            total_frames_vid = len(vr)
+            vr = decord.VideoReader(os.path.join(args.video_root, fname), ctx=decord.cpu(0))
+            total_frames = len(vr)
             video_fps = vr.get_avg_fps()
 
-            nframes = max(
-                round_by_factor(int(total_frames_vid / video_fps * FPS), FRAME_FACTOR),
-                FRAME_FACTOR
-            )
-            nframes = min(nframes, total_frames_vid)
+            nframes = max(round(total_frames / video_fps * FPS / FRAME_FACTOR) * FRAME_FACTOR, FRAME_FACTOR)
+            nframes = min(nframes, total_frames)
+            frame_idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+            sample_fps = nframes / total_frames * video_fps
 
-            frame_idx = torch.linspace(0, total_frames_vid - 1, nframes).round().long().tolist()
-            sample_fps = nframes / total_frames_vid * video_fps
+            frames = vr.get_batch(frame_idx).asnumpy()
+            pil_frames = [Image.fromarray(f) for f in frames]
 
-            try:
-                raw_frames = vr.get_batch(frame_idx).asnumpy()
-            except Exception as ex:
-                print(f"decord read failed for {vid}: {ex}")
-                continue
+            # Extract per-frame features
+            all_feats = []
+            all_thw = []
+            for i in range(0, len(pil_frames), args.batch_size):
+                batch = pil_frames[i:i + args.batch_size]
+                inputs = processor.image_processor(batch, return_tensors="pt")
+                px = inputs["pixel_values"].to(device, torch.bfloat16)
+                thw = inputs["image_grid_thw"].to(device)
+                feat = model.model.get_image_features(px, thw, return_dict=False)
+                if isinstance(feat, (list, tuple)):
+                    feat = torch.cat([f.squeeze(0) if f.dim() == 3 else f for f in feat], dim=0)
+                all_feats.append(feat.cpu())
+                all_thw.append(thw.cpu())
 
-            pil_frames = [Image.fromarray(f) for f in raw_frames]
+            feats_flat = torch.cat(all_feats, dim=0)
+            thw_all = torch.cat(all_thw, dim=0)
 
-            # Qwen3-VL: process each frame as image, extract features
-            all_features = []
-            bs = args.batch_size
-            for bi in range(0, len(pil_frames), bs):
-                batch_pil = pil_frames[bi:bi + bs]
-                inputs = processor.image_processor(batch_pil, return_tensors="pt")
-                pixel_values = inputs["pixel_values"].to(device, dtype=torch.bfloat16)
-                image_grid_thw = inputs["image_grid_thw"].to(device)
-
-                feats = model.model.get_image_features(
-                    pixel_values, image_grid_thw, return_dict=False
-                )
-                # feats: list of tensors or single tensor, one per image
-                if isinstance(feats, (list, tuple)):
-                    feats = torch.cat([f if f.dim() == 2 else f.squeeze(0) for f in feats], dim=0)
-                all_features.append(feats.cpu())
-
-            features_flat = torch.cat(all_features, dim=0)
-            # features_flat: [total_tokens_all_frames, hidden_dim]
-
-            # Split back to per-frame using image_grid_thw
-            # Re-process all to get the thw info
-            all_inputs = processor.image_processor(pil_frames, return_tensors="pt")
-            all_thw = all_inputs["image_grid_thw"]
-            merge_size = processor.image_processor.merge_size
+            # Split flat features back to per-frame by token count
             tokens_per_frame = []
-            for thw in all_thw:
-                t, h, w = thw[0].item(), thw[1].item(), thw[2].item()
-                tokens_per_frame.append(t * (h // merge_size) * (w // merge_size))
+            for thw in thw_all:
+                t, h, w = thw.tolist()
+                tokens_per_frame.append(int(t * (h // merge_size) * (w // merge_size)))
+            per_frame = torch.split(feats_flat, tokens_per_frame)
 
-            # Reshape each frame's flat features to 2D spatial
-            per_frame_features = torch.split(features_flat, tokens_per_frame)
-            # Find common spatial shape for all frames
-            native_h = all_thw[0][1].item() // merge_size
-            native_w = all_thw[0][2].item() // merge_size
-            native_tokens = native_h * native_w
+            # Resize each frame to common spatial shape, then stack
+            target_h = thw_all[0][1].item() // merge_size
+            target_w = thw_all[0][2].item() // merge_size
+            native_tokens = target_h * target_w
 
-            # Stack into [nframes, H, W, D]
-            features_4d = []
-            for ff in per_frame_features:
+            frames_4d = []
+            for ff in per_frame:
                 if ff.shape[0] == native_tokens:
-                    features_4d.append(ff.reshape(native_h, native_w, -1))
+                    frames_4d.append(ff.reshape(target_h, target_w, -1))
                 else:
-                    # Different spatial size → resize to common
-                    h_i = int(math.sqrt(ff.shape[0] * native_h / native_w))
-                    w_i = ff.shape[0] // max(h_i, 1)
-                    if h_i * w_i != ff.shape[0]:
-                        h_i = int(math.sqrt(ff.shape[0]))
-                        w_i = h_i
+                    side = int(math.sqrt(ff.shape[0]))
+                    if side * side != ff.shape[0]:
+                        side_h = int(math.sqrt(ff.shape[0] * target_h / target_w))
+                        side_w = ff.shape[0] // max(side_h, 1)
+                    else:
+                        side_h = side_w = side
                     resized = F.interpolate(
-                        ff.reshape(1, h_i, w_i, -1).permute(0, 3, 1, 2),
-                        size=(native_h, native_w), mode='bilinear', align_corners=False
-                    ).permute(0, 2, 3, 1).squeeze(0)
-                    features_4d.append(resized)
+                        ff.reshape(1, side_h, side_w, -1).permute(0, 3, 1, 2).float(),
+                        size=(target_h, target_w), mode='bilinear', align_corners=False
+                    ).permute(0, 2, 3, 1).squeeze(0).to(ff.dtype)
+                    frames_4d.append(resized)
 
-            features_stacked = torch.stack(features_4d, dim=0)
-            # features_stacked: [nframes, native_h, native_w, D]
+            feats_stacked = torch.stack(frames_4d, dim=0)  # [nframes, h, w, D]
 
-            # Token compression to fit budget
-            n_res = max(args.n_total // nframes, 4)
-            res_side = max(int(math.sqrt(n_res)), 2)
-            features_compressed = resize_feature(features_stacked, res_side, res_side)
+            # Token compression
+            res_side = max(int(math.sqrt(max(args.n_total // nframes, 4))), 2)
+            feats_out = resize_feature(feats_stacked, res_side, res_side)
 
-            print(f"  {vid}: {nframes} frames, {native_tokens}→{res_side}x{res_side}={res_side**2}/frame, "
-                  f"total={nframes * res_side**2}")
+            assert feats_out.shape[0] == len(frame_idx), \
+                f"feature {feats_out.shape[0]} != frame_idx {len(frame_idx)}"
 
-            torch.save(
-                {
-                    "feature": features_compressed,
-                    "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
-                    "sample_fps": float(sample_fps),
-                },
-                out_path,
-            )
+            torch.save({
+                "feature": feats_out,
+                "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
+                "sample_fps": float(sample_fps),
+            }, out_path)
+
+            print(f"  {vid}: {nframes}fr, {native_tokens}→{res_side**2}tok/fr, total={nframes*res_side**2}")
 
 
 if __name__ == "__main__":
