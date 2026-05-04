@@ -106,7 +106,7 @@ class VideoCentricDataset(Dataset):
         if self.feat_folder is not None and feature_path is None:
             feature_path = os.path.join(self.feat_folder,f"{vid}.pt")
 
-        if self.model_family_id == "gemma3":
+        if self.model_family_id in ("gemma3", "gemma4", "qwen3-vl"):
             message = self.construct_messages_gemma3(
                 video_path=video_path,
                 feature_path=feature_path,
