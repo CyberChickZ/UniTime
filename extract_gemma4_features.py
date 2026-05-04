@@ -67,19 +67,22 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model_local_path)
 
     # Detect actual tokens per image from a dummy forward
-    dummy_img = Image.fromarray(__import__('numpy').zeros((224, 224, 3), dtype=__import__('numpy').uint8))
+    import numpy as np
+    dummy_img = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
     dummy_in = processor.image_processor([dummy_img], return_tensors="pt")
     dummy_px = dummy_in["pixel_values"].to(device, torch.bfloat16)
     dummy_pos = dummy_in.get("image_position_ids")
     if dummy_pos is not None:
         dummy_pos = dummy_pos.to(device)
-    dummy_out = model.get_image_features(dummy_px, dummy_pos)
-    mm_tokens = dummy_out.pooler_output.shape[1]
-    hidden_dim = dummy_out.pooler_output.shape[2]
+    with torch.no_grad():
+        dummy_out = model.get_image_features(dummy_px, dummy_pos)
+    po = dummy_out.pooler_output
+    # pooler_output: [mm_tokens, hidden] (2D, no batch dim)
+    mm_tokens = po.shape[0]
     mm_h, mm_w = find_hw(mm_tokens)
-    del dummy_img, dummy_in, dummy_px, dummy_pos, dummy_out
+    del dummy_img, dummy_in, dummy_px, dummy_pos, dummy_out, po
     torch.cuda.empty_cache()
-    print(f"actual tokens/image={mm_tokens} ({mm_h}x{mm_w}), hidden={hidden_dim}")
+    print(f"actual tokens/image={mm_tokens} ({mm_h}x{mm_w})")
 
     videos = sorted(f for f in os.listdir(args.video_root)
                     if f.lower().endswith((".mp4", ".avi", ".mkv", ".mov")))
@@ -116,7 +119,11 @@ def main():
                 if pos_ids is not None:
                     pos_ids = pos_ids.to(device)
                 out = model.get_image_features(px, pos_ids)
-                feats.append(out.pooler_output.cpu())
+                po = out.pooler_output.cpu()
+                # pooler_output: [batch*mm_tokens, hidden] (flat) → [batch, mm_tokens, hidden]
+                bs = len(batch)
+                po = po.reshape(bs, mm_tokens, -1)
+                feats.append(po)
             feats = torch.cat(feats, dim=0)  # [nframes, mm_tokens, hidden]
 
             # Token compression
