@@ -1,5 +1,6 @@
 """
-Evaluate UniTime + Gemma3 LoRA on GTEA. One instance at a time, clear GPU between each.
+Evaluate UniTime LoRA on GTEA. Supports gemma3, gemma4, qwen3-vl (feature_inputs path).
+One instance at a time, clear GPU between each.
 """
 import os
 os.environ.setdefault("CUDA_HOME", "/usr/local/apps/cuda/12.1")
@@ -12,8 +13,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoConfig
 
-from models.gemma3_vl import Gemma3VLMRForConditionalGeneration, Gemma3VLMRProcessor
-from collators.gemma3_vl import Gemma3DataCollator
+from collators import COLLATORS
+from loaders import LOADERS
 from datasets_mr import VideoCentricDataset
 
 PAD_IDX = -100
@@ -27,28 +28,30 @@ def main():
     ap.add_argument("--feat_folder", required=True)
     ap.add_argument("--video_folder", default=None)
     ap.add_argument("--output", required=True)
+    ap.add_argument("--model_family", default="gemma3", choices=["gemma3", "gemma4", "qwen3-vl"])
     args = ap.parse_args()
 
     device = torch.device("cuda")
 
-    base = Gemma3VLMRForConditionalGeneration.from_pretrained(
-        args.base_model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-    ).to(device).eval()
+    loader_cls = LOADERS[args.model_family]
+    loader = loader_cls(
+        model_hf_path=args.base_model,
+        model_local_path=args.base_model,
+        compute_dtype=torch.bfloat16,
+    )
+    base, tokenizer, processor, config = loader.load()
+    base = base.to(device).eval()
     model = PeftModel.from_pretrained(base, args.adapter).eval()
-
-    processor = Gemma3VLMRProcessor.from_pretrained(args.base_model)
-    tokenizer = processor.tokenizer
-    config = AutoConfig.from_pretrained(args.base_model)
 
     eval_ds = VideoCentricDataset(
         data_path=args.eval_data_path,
         video_folder=args.video_folder,
         feat_folder=args.feat_folder,
         fps=2, split="val", num_clips=32, clip_length=-1,
-        model_family_id="gemma3",
+        model_family_id=args.model_family,
     )
 
-    collator = Gemma3DataCollator(
+    collator = COLLATORS[args.model_family](
         config=config, tokenizer=tokenizer, processor=processor,
         mask_question_tokens=True,
     )
