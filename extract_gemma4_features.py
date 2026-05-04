@@ -42,7 +42,7 @@ from models.gemma4_vl import Gemma4VLMRForConditionalGeneration
 
 FRAME_FACTOR = 2
 FPS = 2.0
-N_TOTAL = 16384
+N_TOTAL = 12288
 
 
 def round_by_factor(number, factor):

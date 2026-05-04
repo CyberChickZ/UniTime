@@ -34,7 +34,7 @@ from models.qwen3_vl import Qwen3VLMRForConditionalGeneration
 
 FRAME_FACTOR = 2
 FPS = 2.0
-N_TOTAL = 16384
+N_TOTAL = 12288
 
 
 def round_by_factor(number, factor):
