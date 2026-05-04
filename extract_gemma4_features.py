@@ -97,7 +97,8 @@ def main():
                 pos_ids = inputs.get("image_position_ids")
                 if pos_ids is not None:
                     pos_ids = pos_ids.to(device)
-                feats.append(model.get_image_features(px, pos_ids).cpu())
+                out = model.get_image_features(px, pos_ids)
+                feats.append(out.pooler_output.cpu())
             feats = torch.cat(feats, dim=0)  # [nframes, mm_tokens, hidden]
 
             res_side = max(int(math.sqrt(max(args.n_total // nframes, 4))), 2)

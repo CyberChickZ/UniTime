@@ -96,9 +96,9 @@ def main():
                 inputs = processor.image_processor(batch, return_tensors="pt")
                 px = inputs["pixel_values"].to(device, torch.bfloat16)
                 thw = inputs["image_grid_thw"].to(device)
-                feat = model.model.get_image_features(px, thw, return_dict=False)
-                if isinstance(feat, (list, tuple)):
-                    feat = torch.cat([f.squeeze(0) if f.dim() == 3 else f for f in feat], dim=0)
+                out = model.model.get_image_features(px, thw)
+                pooler = out.pooler_output  # list of tensors, one per image
+                feat = torch.cat(pooler, dim=0)
                 all_feats.append(feat.cpu())
                 all_thw.append(thw.cpu())
 
