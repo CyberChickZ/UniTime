@@ -66,23 +66,8 @@ def main():
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_local_path)
 
-    # Detect actual tokens per image from a dummy forward
-    import numpy as np
-    dummy_img = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
-    dummy_in = processor.image_processor([dummy_img], return_tensors="pt")
-    dummy_px = dummy_in["pixel_values"].to(device, torch.bfloat16)
-    dummy_pos = dummy_in.get("image_position_ids")
-    if dummy_pos is not None:
-        dummy_pos = dummy_pos.to(device)
-    with torch.no_grad():
-        dummy_out = model.get_image_features(dummy_px, dummy_pos)
-    po = dummy_out.pooler_output
-    # pooler_output: [mm_tokens, hidden] (2D, no batch dim)
-    mm_tokens = po.shape[0]
-    mm_h, mm_w = find_hw(mm_tokens)
-    del dummy_img, dummy_in, dummy_px, dummy_pos, dummy_out, po
-    torch.cuda.empty_cache()
-    print(f"actual tokens/image={mm_tokens} ({mm_h}x{mm_w})")
+    hidden_dim = model.config.text_config.hidden_size
+    print(f"text hidden_dim={hidden_dim}")
 
     videos = sorted(f for f in os.listdir(args.video_root)
                     if f.lower().endswith((".mp4", ".avi", ".mkv", ".mov")))
@@ -110,29 +95,37 @@ def main():
             frames = vr.get_batch(frame_idx).asnumpy()
             pil_frames = [Image.fromarray(f) for f in frames]
 
-            feats = []
-            for i in range(0, len(pil_frames), args.batch_size):
-                batch = pil_frames[i:i + args.batch_size]
-                inputs = processor.image_processor(batch, return_tensors="pt")
+            # Extract per-frame: pooler_output is [tokens, hidden_dim] (already
+            # projected to text hidden_dim by embed_vision). Token count may vary
+            # across images due to adaptive resolution, so process one at a time.
+            per_frame_feats = []
+            for img in pil_frames:
+                inputs = processor.image_processor([img], return_tensors="pt")
                 px = inputs["pixel_values"].to(device, torch.bfloat16)
                 pos_ids = inputs.get("image_position_ids")
                 if pos_ids is not None:
                     pos_ids = pos_ids.to(device)
                 out = model.get_image_features(px, pos_ids)
-                po = out.pooler_output.cpu()
-                # pooler_output: [batch*mm_tokens, hidden] (flat) → [batch, mm_tokens, hidden]
-                bs = len(batch)
-                po = po.reshape(bs, mm_tokens, -1)
-                feats.append(po)
-            feats = torch.cat(feats, dim=0)  # [nframes, mm_tokens, hidden]
+                po = out.pooler_output.cpu()  # [tokens_this_image, hidden_dim]
+                per_frame_feats.append(po)
 
-            # Token compression
+            # Token compression: resize each frame's tokens to a fixed grid
             n_res = max(args.n_total // nframes, 4)
             res_h, res_w = find_hw(n_res) if n_res > 4 else (2, 2)
-            feats_4d = feats.reshape(nframes, mm_h, mm_w, -1)
-            feats_out = resize_feature(feats_4d, res_h, res_w)
+
+            compressed = []
+            for po in per_frame_feats:
+                n_tok = po.shape[0]
+                src_h, src_w = find_hw(n_tok)
+                frame_4d = po.reshape(1, src_h, src_w, -1)  # [1, h, w, D]
+                frame_resized = resize_feature(frame_4d, res_h, res_w)  # [1, res_h, res_w, D]
+                compressed.append(frame_resized.squeeze(0))
+            feats_out = torch.stack(compressed, dim=0)  # [nframes, res_h, res_w, D]
 
             assert feats_out.shape[0] == len(frame_idx)
+            assert feats_out.shape[-1] == hidden_dim, (
+                f"expected D={hidden_dim}, got {feats_out.shape[-1]}"
+            )
 
             torch.save({
                 "feature": feats_out,
@@ -140,7 +133,8 @@ def main():
                 "sample_fps": float(sample_fps),
             }, out_path)
 
-            print(f"  {vid}: {nframes}fr, {mm_tokens}->{res_h}x{res_w}={res_h*res_w}tok/fr, total={nframes*res_h*res_w}")
+            tok0 = per_frame_feats[0].shape[0]
+            print(f"  {vid}: {nframes}fr, {tok0}->{res_h}x{res_w}={res_h*res_w}tok/fr, total={nframes*res_h*res_w}")
 
 
 if __name__ == "__main__":
