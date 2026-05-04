@@ -75,15 +75,9 @@ class Gemma3DataCollator(BaseDataCollator):
         self.start_of_turn_id = self.tokenizer.convert_tokens_to_ids("<start_of_turn>")
         self.end_of_turn_id = self.tokenizer.convert_tokens_to_ids("<end_of_turn>")
 
-        # mm_tokens_per_image is a Gemma3Config field; default 256 if missing.
-        self.mm_tokens_per_image = (
+        self.mm_tokens_per_image_config = (
             getattr(self.config, "mm_tokens_per_image", None)
             or 256
-        )
-
-        # The expanded form for one image, matching what Gemma3Processor would emit.
-        self.full_image_sequence = (
-            "\n\n" + self.boi_token + (self.image_token * self.mm_tokens_per_image) + self.eoi_token + "\n\n"
         )
 
     @property
@@ -92,14 +86,16 @@ class Gemma3DataCollator(BaseDataCollator):
 
     # ---- per-instance prompt construction ----
 
-    def build_user_text(self, sampled_timestamps: List[float], query: str,
-                        combine_t_list: Optional[List[int]] = None) -> str:
-        """Build the text content of the user turn (timestamp+image alternation + query).
+    def _make_image_sequence(self, tokens_per_image: int) -> str:
+        return (
+            "\n\n" + self.boi_token
+            + (self.image_token * tokens_per_image)
+            + self.eoi_token + "\n\n"
+        )
 
-        When combine_t_list is provided, each timestamp is followed by combine_t_list[i]
-        image sequences (multiple frames per timestamp chunk). This matches UniTime's
-        upstream combine_timestamps behavior.
-        """
+    def build_user_text(self, sampled_timestamps: List[float], query: str,
+                        combine_t_list: Optional[List[int]] = None,
+                        tokens_per_image: int = 256) -> str:
         if self.target_mode == "binary":
             instruction = (
                 "This is a sequence of video frames with timestamps. "
@@ -112,13 +108,14 @@ class Gemma3DataCollator(BaseDataCollator):
                 "This is a sequence interleaved with timestamps and frames. "
                 "Your task is to identify the specific timestamp(s) when the given query appears.\n"
             )
+        img_seq = self._make_image_sequence(tokens_per_image)
         parts = [instruction]
         if combine_t_list is None:
             combine_t_list = [1] * len(sampled_timestamps)
         for t, n_frames in zip(sampled_timestamps, combine_t_list):
             parts.append(f"timestamp: {t} seconds")
             for _ in range(n_frames):
-                parts.append(self.full_image_sequence)
+                parts.append(img_seq)
         parts.append(f"\nQuery: {query}\nAnswer:")
         return "".join(parts)
 
@@ -239,16 +236,21 @@ class Gemma3DataCollator(BaseDataCollator):
             # phase-2 single-query: only the first window list is used.
             windows = temporal_window[0]
 
-            user_text = self.build_user_text(sampled_timestamps, query_text, combine_t_list)
+            # Derive tokens_per_image from feature shape
+            # 4D [T, H', W', D] → H'*W'; 3D [T, 256, D] → 256
+            if feature.dim() == 4:
+                tokens_per_image = feature.shape[1] * feature.shape[2]
+            else:
+                tokens_per_image = feature.shape[1]
+
+            user_text = self.build_user_text(sampled_timestamps, query_text, combine_t_list, tokens_per_image)
             target_text = self.build_target_text(sampled_timestamps, windows)
             input_ids, labels = self.build_full_prompt(user_text, target_text)
 
             all_input_ids.append(input_ids)
             all_labels.append(labels)
-            all_features.append(feature)  # [T, 256, hidden]
+            all_features.append(feature)
 
-        # Pad to longest sequence in batch (left-padding for Qwen-style;
-        # right-padding is fine for training)
         max_len = max(len(x) for x in all_input_ids)
         pad_id = self.PAD_TOKEN_ID
 
@@ -260,23 +262,16 @@ class Gemma3DataCollator(BaseDataCollator):
             labels_tensor[i, : len(lbls)] = torch.tensor(lbls, dtype=torch.long)
             attention_mask[i, : len(ids)] = 1
 
-        # Concatenate features into a single flat tensor matching the total
-        # number of image_token slots in input_ids.
-        # Each video contributes [T, 256, hidden] -> reshape to [T*256, hidden]
-        # The wrapper's masked_scatter only needs total numel to match.
         feature_inputs_concat = torch.cat(
             [f.reshape(-1, f.shape[-1]) for f in all_features], dim=0
         )
 
-        # Sanity check: number of image-token positions should match feature rows
         n_image_slots = (input_ids_tensor == self.image_token_id).sum().item()
         if n_image_slots != feature_inputs_concat.shape[0]:
             raise RuntimeError(
                 f"image-token slot count {n_image_slots} != feature row count "
-                f"{feature_inputs_concat.shape[0]}. Each frame should produce "
-                f"{self.mm_tokens_per_image} image tokens; check that "
-                f"build_user_text inserts the right number of full_image_sequence "
-                f"chunks per frame."
+                f"{feature_inputs_concat.shape[0]}. Feature shape per video: "
+                f"{[tuple(f.shape) for f in all_features]}"
             )
 
         return dict(

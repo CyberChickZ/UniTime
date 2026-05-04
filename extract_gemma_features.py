@@ -1,25 +1,12 @@
 """
 Extract Gemma3 vision features for UniTime training.
 
-Aligned with UniTime upstream pipeline:
-  1. Compute frame budget from N_total / mm_tokens_per_image
-     (Gemma3 has fixed 256 tokens/frame, so max frames = 16384/256 = 64)
-  2. Uniformly sample that many frames
-  3. Run vision_tower + multi_modal_projector → [N, 256, hidden_dim]
-  4. No spatial compression needed (unlike Qwen2-VL which resizes spatially)
-     because we limit frame count instead
-
-The tradeoff vs Qwen2-VL:
-  - Qwen2-VL: many frames (120+), low spatial res per frame (~64 tokens)
-  - Gemma3: fewer frames (64), high spatial res per frame (256 tokens)
-  - Same total token budget (16384)
-
-Output schema:
-    {
-        "feature":     bf16 tensor [N, 256, hidden_dim]
-        "frame_idx":   int64 tensor [N]
-        "sample_fps":  float
-    }
+Aligned with UniTime upstream pipeline (feature_offline.py for Qwen2-VL):
+  1. Sample at 2fps (dense)
+  2. Run vision_tower + multi_modal_projector → [N, 256, hidden_dim]
+  3. Token compression: reshape 256 → 16×16, bilinear resize to
+     H'×W' ≈ N_total / N_f tokens per frame
+  4. Save [N, H', W', hidden_dim] — same schema as Qwen2-VL features
 
 Usage:
     python extract_gemma_features.py \\
@@ -38,6 +25,7 @@ import argparse
 import math
 
 import torch
+import torch.nn.functional as F
 import decord
 from PIL import Image
 from tqdm import tqdm
@@ -46,11 +34,19 @@ from transformers import AutoProcessor
 from models.gemma3_vl import Gemma3VLMRForConditionalGeneration
 
 FRAME_FACTOR = 2
+FPS = 2.0
 N_TOTAL = 16384
 
 
 def round_by_factor(number, factor):
     return round(number / factor) * factor
+
+
+def resize_feature(feature, resize_h, resize_w):
+    feature = feature.permute(0, 3, 1, 2)
+    feature_resized = F.interpolate(feature, size=(resize_h, resize_w), mode='bilinear', align_corners=False)
+    feature_resized = feature_resized.permute(0, 2, 3, 1)
+    return feature_resized
 
 
 def parse_args():
@@ -59,8 +55,7 @@ def parse_args():
     ap.add_argument("--feat_root", required=True, type=str)
     ap.add_argument("--model_local_path", required=True, type=str)
     ap.add_argument("--dataset_name", default="gtea", type=str)
-    ap.add_argument("--n_total", default=N_TOTAL, type=int,
-                    help="Total token budget (paper default 16384)")
+    ap.add_argument("--n_total", default=N_TOTAL, type=int)
     ap.add_argument("--part", default=0, type=int)
     ap.add_argument("--num_parts", default=1, type=int)
     ap.add_argument("--gpu", default=0, type=int)
@@ -84,9 +79,8 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model_local_path)
 
     mm_tokens = getattr(model.config, "mm_tokens_per_image", 256)
-    max_frames = args.n_total // mm_tokens
-    max_frames = max_frames // FRAME_FACTOR * FRAME_FACTOR
-    print(f"mm_tokens_per_image={mm_tokens}, max_frames={max_frames} (budget {args.n_total})")
+    mm_side = int(math.sqrt(mm_tokens))
+    print(f"mm_tokens_per_image={mm_tokens}, spatial={mm_side}x{mm_side}")
 
     valid_ext = (".mp4", ".avi", ".mkv", ".mov", ".webm")
     all_videos = sorted(
@@ -117,8 +111,11 @@ def main():
             total_frames_vid = len(vr)
             video_fps = vr.get_avg_fps()
 
-            nframes = min(max_frames, total_frames_vid)
-            nframes = max(nframes // FRAME_FACTOR * FRAME_FACTOR, FRAME_FACTOR)
+            nframes = max(
+                round_by_factor(int(total_frames_vid / video_fps * FPS), FRAME_FACTOR),
+                FRAME_FACTOR
+            )
+            nframes = min(nframes, total_frames_vid)
 
             frame_idx = torch.linspace(0, total_frames_vid - 1, nframes).round().long().tolist()
             sample_fps = nframes / total_frames_vid * video_fps
@@ -141,14 +138,24 @@ def main():
                 all_features.append(feats)
 
             features = torch.cat(all_features, dim=0)
+            # features: [nframes, mm_tokens=256, hidden_dim]
+
+            # Token compression (same as feature_offline.py resize_feature)
+            n_res = max(args.n_total // nframes, 4)
+            res_side = max(int(math.sqrt(n_res)), 2)
+
+            features_4d = features.reshape(features.shape[0], mm_side, mm_side, features.shape[-1])
+            features_compressed = resize_feature(features_4d, res_side, res_side)
+            # features_compressed: [nframes, res_side, res_side, hidden_dim]
 
             fps_sample_idx = [int((x + y) / 2) for x, y in zip(frame_idx[::2], frame_idx[1::2])]
 
-            print(f"  {vid}: {nframes} frames × {mm_tokens} tokens = {nframes * mm_tokens}")
+            print(f"  {vid}: {nframes} frames, {mm_tokens}→{res_side}x{res_side}={res_side**2}/frame, "
+                  f"total={nframes * res_side**2} tokens")
 
             torch.save(
                 {
-                    "feature": features,
+                    "feature": features_compressed,
                     "frame_idx": torch.tensor(fps_sample_idx, dtype=torch.long),
                     "sample_fps": float(sample_fps),
                 },
