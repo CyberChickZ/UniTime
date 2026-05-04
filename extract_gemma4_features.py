@@ -157,15 +157,13 @@ def main():
             features_4d = features.reshape(features.shape[0], mm_side, mm_side, features.shape[-1])
             features_compressed = resize_feature(features_4d, res_side, res_side)
 
-            fps_sample_idx = [int((x + y) / 2) for x, y in zip(frame_idx[::2], frame_idx[1::2])]
-
             print(f"  {vid}: {nframes} frames, {mm_tokens}→{res_side}x{res_side}={res_side**2}/frame, "
                   f"total={nframes * res_side**2}")
 
             torch.save(
                 {
                     "feature": features_compressed,
-                    "frame_idx": torch.tensor(fps_sample_idx, dtype=torch.long),
+                    "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
                     "sample_fps": float(sample_fps),
                 },
                 out_path,
