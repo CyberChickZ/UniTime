@@ -91,15 +91,45 @@ class Gemma4DataCollator(BaseDataCollator):
         parts.append(f"\nQuery: {query}\nAnswer:")
         return "".join(parts)
 
-    def build_full_prompt(self, user_text, target_text):
+    def _tokenize(self, text):
+        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    def build_input_ids_direct(self, sampled_timestamps, query, combine_t_list,
+                                tokens_per_image, target_text):
+        """Build input_ids by inserting image token IDs directly as integers.
+
+        Avoids string-concatenation of <image_soft_token>×N which the tokenizer
+        may not faithfully round-trip back to exactly N token IDs.
+        """
         bos = self.tokenizer.bos_token or ""
-        prompt_text = (
-            f"{bos}<|turn>user\n{user_text}<turn|>\n"
-            f"<|turn>model\n"
+        instruction = (
+            "This is a sequence interleaved with timestamps and frames. "
+            "Your task is to identify the specific timestamp(s) when the given query appears.\n"
         )
-        target_with_eot = f"{target_text}<turn|>\n"
-        prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-        target_ids = self.tokenizer(target_with_eot, add_special_tokens=False)["input_ids"]
+        header_ids = self._tokenize(f"{bos}<|turn>user\n{instruction}")
+
+        boi_id = self.config.boi_token_id
+        eoi_id = self.config.eoi_token_id
+        img_tok = self.image_token_id
+        newline_ids = self._tokenize("\n\n")
+
+        body_ids = []
+        if combine_t_list is None:
+            combine_t_list = [1] * len(sampled_timestamps)
+        for t, n_frames in zip(sampled_timestamps, combine_t_list):
+            body_ids.extend(self._tokenize(f"timestamp: {t} seconds"))
+            for _ in range(n_frames):
+                body_ids.extend(newline_ids)
+                body_ids.append(boi_id)
+                body_ids.extend([img_tok] * tokens_per_image)
+                body_ids.append(eoi_id)
+                body_ids.extend(newline_ids)
+
+        query_ids = self._tokenize(f"\nQuery: {query}\nAnswer:")
+        turn_end_ids = self._tokenize("<turn|>\n<|turn>model\n")
+        target_ids = self._tokenize(f"{target_text}<turn|>\n")
+
+        prompt_ids = header_ids + body_ids + query_ids + turn_end_ids
         input_ids = prompt_ids + target_ids
         labels = [PAD_IDX] * len(prompt_ids) + list(target_ids)
         return input_ids, labels
@@ -147,9 +177,11 @@ class Gemma4DataCollator(BaseDataCollator):
             else:
                 tokens_per_image = feature.shape[1]
 
-            user_text = self.build_user_text(sampled_timestamps, query_text, combine_t_list, tokens_per_image)
             target_text = self.build_target_text(sampled_timestamps, windows)
-            input_ids, labels = self.build_full_prompt(user_text, target_text)
+            input_ids, labels = self.build_input_ids_direct(
+                sampled_timestamps, query_text, combine_t_list,
+                tokens_per_image, target_text,
+            )
 
             all_input_ids.append(input_ids)
             all_labels.append(labels)
