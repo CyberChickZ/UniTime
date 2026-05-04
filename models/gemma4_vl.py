@@ -131,7 +131,7 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 past_key_values=lm_out.past_key_values,
             )
 
-        # Pass-through (raw pixel_values path) — let the base do its full merge.
+        # Pass-through (raw pixel_values path)
         return super().forward(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -150,6 +150,48 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        inputs_embeds=None,
+        position_ids=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        input_features=None,
+        attention_mask=None,
+        input_features_mask=None,
+        token_type_ids=None,
+        use_cache=True,
+        logits_to_keep=None,
+        labels=None,
+        is_first_iteration=False,
+        feature_inputs=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            input_features=input_features,
+            attention_mask=attention_mask,
+            input_features_mask=input_features_mask,
+            token_type_ids=token_type_ids,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
+            labels=labels,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+        if is_first_iteration or not use_cache:
+            model_inputs["feature_inputs"] = feature_inputs
+        else:
+            model_inputs["feature_inputs"] = None
+        return model_inputs
 
 
 # ---------------------------------------------------------------------------

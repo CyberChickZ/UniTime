@@ -168,7 +168,7 @@ def evaluate(args):
     eval_data = json.load(open(args.eval_json))
     preds = [p for p in eval_data["predictions"] if "error" not in p]
 
-    # Group by video
+    # Group by video, carry per-prediction sampled_timestamps if available
     by_video = defaultdict(list)
     for p in preds:
         qid = p["qid"]
@@ -183,15 +183,17 @@ def evaluate(args):
         by_video[vid].append({
             "action": action, "windows": windows,
             "duration": duration, "pred_text": p["pred_text"],
+            "sampled_timestamps": p.get("sampled_timestamps"),
+            "n_frames": p.get("n_frames"),
         })
 
-    NUM_SPARSE = 32
     all_correct, all_total = 0, 0
     overlap_thresholds = [0.1, 0.25, 0.5]
     tp_all = {k: 0 for k in overlap_thresholds}
     fp_all = {k: 0 for k in overlap_thresholds}
     fn_all = {k: 0 for k in overlap_thresholds}
     edit_scores = []
+    num_sparse_used = None
 
     for vid in sorted(by_video.keys()):
         entries = by_video[vid]
@@ -204,8 +206,16 @@ def evaluate(args):
                 break
         orig_fps, orig_total = get_video_info(vpath)
 
-        # Sampled timestamps (32 frames)
-        sparse_ts = [round(i / max(NUM_SPARSE - 1, 1) * duration, 1) for i in range(NUM_SPARSE)]
+        # Determine sparse timestamps: use actual sampled_timestamps from
+        # eval if available, otherwise fall back to 32 uniform frames
+        first_ts = entries[0].get("sampled_timestamps")
+        if first_ts is not None:
+            sparse_ts = [float(t) for t in first_ts]
+            NUM_SPARSE = len(sparse_ts)
+        else:
+            NUM_SPARSE = 32
+            sparse_ts = [round(i / max(NUM_SPARSE - 1, 1) * duration, 1) for i in range(NUM_SPARSE)]
+        num_sparse_used = NUM_SPARSE
 
         # Build GT: dense per-frame labels at original fps
         gt_dense = ["background"] * orig_total
@@ -218,7 +228,7 @@ def evaluate(args):
                 for fi in range(s_frame, e_frame):
                     gt_dense[fi] = entry["action"]
 
-        # Build pred: sparse (32 frames) → dense (orig_total frames)
+        # Build pred: sparse → dense
         sparse_pred = ["background"] * NUM_SPARSE
         for entry in entries:
             if args.mode == "binary":
@@ -262,7 +272,7 @@ def evaluate(args):
         "mode": args.mode,
         "videos": len(by_video),
         "total_frames": all_total,
-        "sparse_frames": NUM_SPARSE,
+        "sparse_frames": num_sparse_used if num_sparse_used else 32,
         "Acc": round(acc, 1),
         "F1@10": round(f1_scores[0.1], 1),
         "F1@25": round(f1_scores[0.25], 1),
