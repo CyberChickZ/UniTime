@@ -75,7 +75,9 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             inputs_embeds_local = self.get_input_embeddings()(llm_input_ids)
 
             # 2) Compute PLE from the PAD-replaced IDs (matches base class logic)
-            lm = self.model
+            #    self.model = Gemma4MultiModalModel
+            #    self.model.language_model = Gemma4Model (text backbone with PLE)
+            lm = self.model.language_model
             per_layer_inputs = None
             if getattr(lm, "hidden_size_per_layer_input", 0):
                 per_layer_inputs = lm.get_per_layer_inputs(llm_input_ids, inputs_embeds_local)
@@ -98,8 +100,8 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 else attention_mask
             )
 
-            # 4) Call language_model directly (bypass the conditional-generation
-            #    layer that enforces the input_ids XOR inputs_embeds check)
+            # 4) Call Gemma4Model directly (bypass MultiModalModel + ConditionalGen
+            #    layers that enforce XOR checks and do their own PLE)
             lm_out = lm(
                 input_ids=None,
                 inputs_embeds=inputs_embeds_local,
