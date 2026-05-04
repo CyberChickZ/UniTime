@@ -97,7 +97,7 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 mm_token_type_ids = (input_ids == image_token_id).long()
 
             return super().forward(
-                input_ids=input_ids,
+                input_ids=None,
                 inputs_embeds=inputs_embeds_local,
                 pixel_values=None,
                 pixel_values_videos=None,
