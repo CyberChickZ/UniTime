@@ -101,7 +101,7 @@ def main():
         fps=2,
         split="val",
         num_clips=32,
-        clip_length=32,
+        clip_length=-1,
         model_family_id="gemma3",
     )
     print(f"test set size: {len(eval_ds)} entries")

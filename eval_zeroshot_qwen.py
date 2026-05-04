@@ -79,7 +79,7 @@ def main():
         data_path=args.eval_data_path,
         video_folder=args.video_folder,
         feat_folder=args.feat_folder,
-        fps=2, split="val", num_clips=32, clip_length=32,
+        fps=2, split="val", num_clips=32, clip_length=-1,
         model_family_id="qwen2-vl",
     )
     print(f"test set: {len(eval_ds)} entries")
