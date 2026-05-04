@@ -53,66 +53,80 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
         combine_t_list=None,  # noqa: ARG002 — kept for collator interface symmetry
         **kwargs,
     ) -> Gemma4CausalLMOutputWithPast:
-        # Cached-features path: pre-merge features into inputs_embeds, then call
-        # super().forward with input_ids=None so Gemma4Model.get_placeholder_mask
-        # returns an empty mask (no double-merging) and the vision_tower call is
-        # skipped (pixel_values=None).
+        # Cached-features path: replicate the base class flow but inject our
+        # pre-extracted features instead of running the vision tower.
+        #
+        # Key constraint: Gemma4's PLE (Per-Layer Embeddings) tries to reverse
+        # the embedding lookup when input_ids=None, causing an O(seq×vocab×hidden)
+        # OOM. We must compute PLE from input_ids BEFORE scattering features.
         if feature_inputs is not None:
             if input_ids is None:
                 raise ValueError(
                     "feature_inputs path requires input_ids (to locate image_token "
                     "positions for masked_scatter)."
                 )
-            # Embed text tokens
-            inputs_embeds_local = self.get_input_embeddings()(input_ids)
             image_token_id = self.config.image_token_id
-            image_mask = (
-                (input_ids == image_token_id)
-                .unsqueeze(-1)
-                .expand_as(inputs_embeds_local)
-                .to(inputs_embeds_local.device)
-            )
+            pad_token_id = self.config.text_config.pad_token_id
+            image_mask_1d = (input_ids == image_token_id)
+
+            # 1) Replace image tokens with PAD for clean embedding + PLE
+            llm_input_ids = input_ids.clone()
+            llm_input_ids[image_mask_1d] = pad_token_id
+            inputs_embeds_local = self.get_input_embeddings()(llm_input_ids)
+
+            # 2) Compute PLE from the PAD-replaced IDs (matches base class logic)
+            lm = self.language_model
+            per_layer_inputs = None
+            if getattr(lm, "hidden_size_per_layer_input", 0):
+                per_layer_inputs = lm.get_per_layer_inputs(llm_input_ids, inputs_embeds_local)
+                per_layer_inputs = lm.project_per_layer_inputs(inputs_embeds_local, per_layer_inputs)
+
+            # 3) Scatter cached features into the embedding
+            image_mask = image_mask_1d.unsqueeze(-1).expand_as(inputs_embeds_local)
             features = feature_inputs.to(inputs_embeds_local.device, inputs_embeds_local.dtype)
             if inputs_embeds_local[image_mask].numel() != features.numel():
-                n_text_image_tokens = image_mask.sum().item() // inputs_embeds_local.shape[-1]
+                n_img = image_mask_1d.sum().item()
                 raise ValueError(
-                    f"feature_inputs numel ({features.numel()}) does not match the number of "
-                    f"image-token slots in input_ids ({n_text_image_tokens} tokens × "
-                    f"{inputs_embeds_local.shape[-1]} hidden_dim). Check that your collator "
-                    f"inserts mm_tokens_per_image placeholder tokens per frame matching the "
-                    f"shape of features written by extract_gemma4_features.py."
+                    f"feature_inputs numel ({features.numel()}) != image-token slots "
+                    f"({n_img} tokens × {inputs_embeds_local.shape[-1]} dim)."
                 )
             inputs_embeds_local = inputs_embeds_local.masked_scatter(image_mask, features)
 
-            # Use the explicit multi-qa mask if provided, else let the base class
-            # build the standard causal+bidirectional one.
             attn_mask_to_pass = (
                 attention_mask_multiqa.to(inputs_embeds_local.device, inputs_embeds_local.dtype)
                 if (attention_mask_multiqa is not None and multi_qa)
                 else attention_mask
             )
 
-            # Build mm_token_type_ids for PLE: 0=text, 1=image
-            if mm_token_type_ids is None:
-                mm_token_type_ids = (input_ids == image_token_id).long()
-
-            return super().forward(
+            # 4) Call language_model directly (bypass the conditional-generation
+            #    layer that enforces the input_ids XOR inputs_embeds check)
+            lm_out = lm(
                 input_ids=None,
                 inputs_embeds=inputs_embeds_local,
-                pixel_values=None,
-                pixel_values_videos=None,
-                input_features=None,
                 attention_mask=attn_mask_to_pass,
-                input_features_mask=None,
                 position_ids=position_ids,
-                image_position_ids=None,
-                video_position_ids=None,
                 past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
-                labels=labels,
+                per_layer_inputs=per_layer_inputs,
                 use_cache=use_cache,
-                logits_to_keep=logits_to_keep,
                 **kwargs,
+            )
+            hidden_states = lm_out.last_hidden_state
+
+            loss = None
+            logits = self.lm_head(hidden_states[:, -logits_to_keep:, :])
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = nn.functional.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+
+            return Gemma4CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=lm_out.past_key_values,
             )
 
         # Pass-through (raw pixel_values path) — let the base do its full merge.
