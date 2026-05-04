@@ -66,9 +66,20 @@ def main():
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_local_path)
 
-    mm_tokens = getattr(model.config, "vision_soft_tokens_per_image", 280)
+    # Detect actual tokens per image from a dummy forward
+    dummy_img = Image.fromarray(__import__('numpy').zeros((224, 224, 3), dtype=__import__('numpy').uint8))
+    dummy_in = processor.image_processor([dummy_img], return_tensors="pt")
+    dummy_px = dummy_in["pixel_values"].to(device, torch.bfloat16)
+    dummy_pos = dummy_in.get("image_position_ids")
+    if dummy_pos is not None:
+        dummy_pos = dummy_pos.to(device)
+    dummy_out = model.get_image_features(dummy_px, dummy_pos)
+    mm_tokens = dummy_out.pooler_output.shape[1]
+    hidden_dim = dummy_out.pooler_output.shape[2]
     mm_h, mm_w = find_hw(mm_tokens)
-    print(f"vision_soft_tokens_per_image={mm_tokens}, spatial={mm_h}x{mm_w}")
+    del dummy_img, dummy_in, dummy_px, dummy_pos, dummy_out
+    torch.cuda.empty_cache()
+    print(f"actual tokens/image={mm_tokens} ({mm_h}x{mm_w}), hidden={hidden_dim}")
 
     videos = sorted(f for f in os.listdir(args.video_root)
                     if f.lower().endswith((".mp4", ".avi", ".mkv", ".mov")))
