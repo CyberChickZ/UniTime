@@ -75,7 +75,7 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             inputs_embeds_local = self.get_input_embeddings()(llm_input_ids)
 
             # 2) Compute PLE from the PAD-replaced IDs (matches base class logic)
-            lm = self.language_model
+            lm = self.model
             per_layer_inputs = None
             if getattr(lm, "hidden_size_per_layer_input", 0):
                 per_layer_inputs = lm.get_per_layer_inputs(llm_input_ids, inputs_embeds_local)
