@@ -92,8 +92,14 @@ class Gemma3DataCollator(BaseDataCollator):
 
     # ---- per-instance prompt construction ----
 
-    def build_user_text(self, sampled_timestamps: List[float], query: str) -> str:
-        """Build the text content of the user turn (timestamp+image alternation + query)."""
+    def build_user_text(self, sampled_timestamps: List[float], query: str,
+                        combine_t_list: Optional[List[int]] = None) -> str:
+        """Build the text content of the user turn (timestamp+image alternation + query).
+
+        When combine_t_list is provided, each timestamp is followed by combine_t_list[i]
+        image sequences (multiple frames per timestamp chunk). This matches UniTime's
+        upstream combine_timestamps behavior.
+        """
         if self.target_mode == "binary":
             instruction = (
                 "This is a sequence of video frames with timestamps. "
@@ -107,9 +113,12 @@ class Gemma3DataCollator(BaseDataCollator):
                 "Your task is to identify the specific timestamp(s) when the given query appears.\n"
             )
         parts = [instruction]
-        for t in sampled_timestamps:
+        if combine_t_list is None:
+            combine_t_list = [1] * len(sampled_timestamps)
+        for t, n_frames in zip(sampled_timestamps, combine_t_list):
             parts.append(f"timestamp: {t} seconds")
-            parts.append(self.full_image_sequence)
+            for _ in range(n_frames):
+                parts.append(self.full_image_sequence)
         parts.append(f"\nQuery: {query}\nAnswer:")
         return "".join(parts)
 
@@ -186,7 +195,7 @@ class Gemma3DataCollator(BaseDataCollator):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         # Phase 2: enforce single-query per instance.
         # Each instance must have exactly one anno (one query, one window list).
-        feature_inputs_list, sampled_ts_list = process_vision_info_gemma3(
+        feature_inputs_list, sampled_ts_list, combine_t_lists = process_vision_info_gemma3(
             [inst["message"] for inst in instances]
         )
         if feature_inputs_list is None:
@@ -199,7 +208,7 @@ class Gemma3DataCollator(BaseDataCollator):
         all_labels: List[List[int]] = []
         all_features: List[torch.Tensor] = []
 
-        for inst, feature, sampled_timestamps in zip(instances, feature_inputs_list, sampled_ts_list):
+        for inst, feature, sampled_timestamps, combine_t_list in zip(instances, feature_inputs_list, sampled_ts_list, combine_t_lists):
             # Extract query + window from the (Qwen-format) message wrapper.
             # The dataset packs everything in the second user-turn after the
             # video item; we read the original temporal_window/mode that the
@@ -230,7 +239,7 @@ class Gemma3DataCollator(BaseDataCollator):
             # phase-2 single-query: only the first window list is used.
             windows = temporal_window[0]
 
-            user_text = self.build_user_text(sampled_timestamps, query_text)
+            user_text = self.build_user_text(sampled_timestamps, query_text, combine_t_list)
             target_text = self.build_target_text(sampled_timestamps, windows)
             input_ids, labels = self.build_full_prompt(user_text, target_text)
 

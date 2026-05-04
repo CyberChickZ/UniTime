@@ -122,12 +122,7 @@ class VideoCentricDataset(Dataset):
         return {"message":message, "split":self.split, "temporal_window":temporal_window, "mode":retrieval_mode, "qid":qid, "duration":duration}
 
     def construct_messages_gemma3(self, video_path, feature_path, querys, temporal_windows, retrieval_segment, duration):
-        """Build a minimal message structure for the Gemma3 collator.
-
-        Unlike Qwen2VL, Gemma3DataCollator builds its prompt text from raw
-        fields, so we just pack the video path/feature path/duration once and
-        the queries as a separate user turn (one per anno).
-        """
+        """Build a minimal message structure for the Gemma3 collator."""
         message = [
             {
                 "role": "user",
@@ -139,6 +134,8 @@ class VideoCentricDataset(Dataset):
                         "video_start": retrieval_segment[0],
                         "video_end": retrieval_segment[1],
                         "duration": duration,
+                        "num_clips": self.num_clips,
+                        "clip_length": self.clip_length,
                     }
                 ],
             },

@@ -1,80 +1,86 @@
 """
-Gemma3 vision processing — cached-features path only.
+Gemma3 vision processing — cached-features path.
 
-Mirrors collators/qwen_vision_process.py:fetch_video / process_vision_info but
-much simpler:
-  - We only support pre-extracted features stored as .pt files (the path used
-    by extract_gemma_features.py).
-  - No live frame loading / no fps math / no Qwen smart_resize.
-  - Each .pt file contains:
-        feature:    bf16 tensor [num_frames, 256, hidden_dim] (post-projector)
-        frame_idx:  int64 tensor [num_frames]
-        sample_fps: float
-  - For UniTime mr_seg, we slice the saved frames to the [video_start, video_end]
-    window (in seconds) and return:
-        feature_inputs:        sliced feature tensor
-        sampled_timestamps:    per-frame timestamp in seconds (rounded to 0.1)
+Aligned with UniTime upstream (feature_offline.py for Qwen2-VL):
+  - 2fps dense extraction + token compression (bilinear resize)
+  - .pt file contains: feature [T, H', W', hidden_dim], frame_idx, sample_fps
+  - combine_timestamps groups frames into chunks (CLIP_LENGTH=-1 auto)
 """
 from typing import List, Optional, Tuple
 
 import torch
 
 
-def fetch_video_feature_only(ele: dict) -> Tuple[Optional[torch.Tensor], Optional[List[float]]]:
+def _generate_clip_lengths(t, clip_length):
+    full_clips = t // clip_length
+    remainder = t % clip_length
+    result = [clip_length] * full_clips
+    if remainder > 0:
+        result.append(remainder)
+    return result
+
+
+def _combine_timestamps_gemma(feature, sampled_timestamps, num_clips=32, clip_length=-1):
+    """Same logic as qwen_vision_process.combine_timestamps.
+
+    Works with both [T, H, W, D] (4D, after token compression) and [T, 256, D] (3D, legacy).
+    """
+    T = feature.shape[0]
+    assert len(sampled_timestamps) == T
+    if clip_length <= 0:
+        clip_length = max(T // num_clips, 1)
+    sampled_timestamps_combine = sampled_timestamps[::int(clip_length)]
+    combine_t_list = _generate_clip_lengths(T, clip_length)
+    return feature, sampled_timestamps_combine, combine_t_list
+
+
+def fetch_video_feature_only(ele: dict) -> Tuple[Optional[torch.Tensor], Optional[List[float]], Optional[List[int]]]:
     """Load cached Gemma3 features for one video clip.
 
-    Args:
-        ele: dict with keys
-            feature:     str path to .pt file
-            video_start: float seconds (default 0)
-            video_end:   float seconds (default video duration)
-            (optional) num_clips, clip_length — IGNORED for Gemma3 phase-2
-                       (the upstream Qwen path uses these for combine_timestamps;
-                       Gemma3 keeps every frame as-is to preserve mr_seg target
-                       construction sanity)
-
     Returns:
-        (feature, sampled_timestamps) where
+        (feature, sampled_timestamps, combine_t_list) where
             feature: tensor [T, 256, hidden_dim] — sliced to the window
-            sampled_timestamps: list of floats, len == T
+            sampled_timestamps: list of floats (after combine)
+            combine_t_list: list of ints, frames per timestamp chunk
     """
     feat_path = ele["feature"]
     payload = torch.load(feat_path, map_location="cpu")
-    feature = payload["feature"]  # [T_total, 256, hidden]
-    frame_idx = payload["frame_idx"]  # [T_total], frame indices into raw video
+    feature = payload["feature"]  # [T_total, H', W', D] (4D) or [T_total, 256, D] (3D legacy)
+    frame_idx = payload["frame_idx"]
     sample_fps = float(payload["sample_fps"])
 
-    # Convert frame_idx (frame numbers in raw video) to seconds.
-    # extract_gemma_features.py records frame_idx as the actual sampled video
-    # frame numbers and sample_fps as nframes / total_frames * video_fps.
-    # We can recover per-frame timestamps as frame_idx / video_fps. We don't
-    # have video_fps directly here, so we reconstruct it from sample_fps and
-    # the total duration in the source video.
     duration = float(ele.get("duration", 0))
     if duration <= 0:
-        # Fallback: treat sample_fps as the sampling rate and use uniform spacing.
         T = feature.shape[0]
         sampled_timestamps = [round(i / max(sample_fps, 1e-6), 1) for i in range(T)]
     else:
         T_total = feature.shape[0]
-        # Uniform sampling between 0 and duration
         sampled_timestamps = [
             round(i / max(T_total - 1, 1) * duration, 1) for i in range(T_total)
         ]
 
-    # Slice to [video_start, video_end]
     video_start = float(ele.get("video_start", 0))
     video_end = float(ele.get("video_end", sampled_timestamps[-1] if sampled_timestamps else duration))
     keep_idx = [i for i, t in enumerate(sampled_timestamps) if video_start <= t <= video_end]
     if not keep_idx:
-        # Defensive: keep at least the closest frame to video_start
         diffs = [abs(t - video_start) for t in sampled_timestamps]
         keep_idx = [int(min(range(len(diffs)), key=lambda i: diffs[i]))]
 
     feature = feature[keep_idx]
     sampled_timestamps = [sampled_timestamps[i] for i in keep_idx]
 
-    return feature, sampled_timestamps
+    num_clips = int(ele.get("num_clips", 32))
+    clip_length_raw = int(ele.get("clip_length", -1))
+    if clip_length_raw > 0:
+        clip_length = int(clip_length_raw * sample_fps / 2)
+    else:
+        clip_length = -1
+
+    feature, sampled_timestamps, combine_t_list = _combine_timestamps_gemma(
+        feature, sampled_timestamps, num_clips=num_clips, clip_length=clip_length
+    )
+
+    return feature, sampled_timestamps, combine_t_list
 
 
 def extract_video_info(messages):
@@ -95,14 +101,17 @@ def process_vision_info_gemma3(messages):
 
     Returns:
         feature_inputs: list of tensors [T, 256, hidden_dim], one per video
-        sampled_timestamps_list: list of [list of float], one per video
+        sampled_timestamps_list: list of [list of float], one per video (after combine)
+        combine_t_lists: list of [list of int], frames per chunk per video
     """
     feature_inputs = []
     sampled_timestamps_list = []
+    combine_t_lists = []
     for video_item in extract_video_info(messages):
-        feature, sampled_timestamps = fetch_video_feature_only(video_item)
+        feature, sampled_timestamps, combine_t_list = fetch_video_feature_only(video_item)
         feature_inputs.append(feature)
         sampled_timestamps_list.append(sampled_timestamps)
+        combine_t_lists.append(combine_t_list)
     if not feature_inputs:
-        return None, None
-    return feature_inputs, sampled_timestamps_list
+        return None, None, None
+    return feature_inputs, sampled_timestamps_list, combine_t_lists

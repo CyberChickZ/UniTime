@@ -1,71 +1,70 @@
 """
 Extract Gemma3 vision features for UniTime training.
 
-Reads videos under --video_root, samples N uniform frames per video, runs them
-through Gemma3's vision_tower + multi_modal_projector, saves the resulting
-[N, mm_tokens_per_image, text_hidden_size] tensor as a .pt file.
+Aligned with UniTime upstream pipeline:
+  1. Compute frame budget from N_total / mm_tokens_per_image
+     (Gemma3 has fixed 256 tokens/frame, so max frames = 16384/256 = 64)
+  2. Uniformly sample that many frames
+  3. Run vision_tower + multi_modal_projector → [N, 256, hidden_dim]
+  4. No spatial compression needed (unlike Qwen2-VL which resizes spatially)
+     because we limit frame count instead
 
-Output schema (mirrors what `extract_qwen_embeddings.py` writes, so the
-collator pipeline can interpret either):
+The tradeoff vs Qwen2-VL:
+  - Qwen2-VL: many frames (120+), low spatial res per frame (~64 tokens)
+  - Gemma3: fewer frames (64), high spatial res per frame (256 tokens)
+  - Same total token budget (16384)
+
+Output schema:
     {
         "feature":     bf16 tensor [N, 256, hidden_dim]
-        "frame_idx":   int64 tensor [N]   (raw video frame indices sampled)
-        "sample_fps":  float              (effective sampling fps)
+        "frame_idx":   int64 tensor [N]
+        "sample_fps":  float
     }
 
 Usage:
     python extract_gemma_features.py \\
-        --video_root      /nfs/hpc/dgx2-4/data/TAS_videos/gtea \\
-        --feat_root       /nfs/hpc/share/zhanhaoc/.../feature/Gemma3-4B \\
+        --video_root /nfs/hpc/dgx2-4/data/TAS_videos/gtea \\
+        --feat_root  /nfs/hpc/dgx2-4/tmp/2026/4/6/feature/Gemma3-4B-it \\
         --model_local_path /nfs/hpc/share/zhanhaoc/MODLE/Gemma3-4B-it \\
-        --dataset_name gtea \\
-        --num_frames 32 \\
-        --gpu 0
+        --dataset_name gtea --gpu 0
 """
 import os
-# IMPORTANT: must be set BEFORE any transformers/deepspeed import.
-# transformers >= 4.51 eagerly imports deepspeed at the top of
-# transformers/modeling_utils.py (every model load triggers it). deepspeed at
-# import time runs op-builder compatibility checks that read CUDA_HOME — if
-# unset, it raises MissingCUDAException and the whole import chain fails.
-# Setting a default here keeps the script runnable as plain `python ...` (the
-# train.sh path already exports this in shell, so it doesn't need this guard).
 os.environ.setdefault("CUDA_HOME", "/usr/local/apps/cuda/12.1")
 
-# IMPORTANT: import torch BEFORE decord. On dgxh-2 (NVIDIA driver 590.48.01,
-# CUDA 13.1 user-space) `import decord` (0.6.0) before torch can pre-init CUDA
-# state in a way that segfaults during deepspeed's auto-detect a few imports
-# later. Order: faulthandler → torch → everything else.
 import faulthandler
 faulthandler.enable()
 
 import argparse
+import math
 
-import torch  # noqa: E402  — must come BEFORE decord
-import decord  # noqa: E402
-from PIL import Image  # noqa: E402
-from tqdm import tqdm  # noqa: E402
-from transformers import AutoProcessor  # noqa: E402
+import torch
+import decord
+from PIL import Image
+from tqdm import tqdm
+from transformers import AutoProcessor
 
-# Requires transformers >= 4.50 (Gemma 3 added in 4.50.0). Pinned env should
-# already be upgraded to 4.51.3 per docs/research_journal.md 2026-04-08 entry.
-from models.gemma3_vl import Gemma3VLMRForConditionalGeneration  # noqa: E402
+from models.gemma3_vl import Gemma3VLMRForConditionalGeneration
+
+FRAME_FACTOR = 2
+N_TOTAL = 16384
+
+
+def round_by_factor(number, factor):
+    return round(number / factor) * factor
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video_root", required=True, type=str)
-    ap.add_argument("--feat_root", required=True, type=str,
-                    help="Output root; final dir is {feat_root}/{dataset_name}")
+    ap.add_argument("--feat_root", required=True, type=str)
     ap.add_argument("--model_local_path", required=True, type=str)
     ap.add_argument("--dataset_name", default="gtea", type=str)
-    ap.add_argument("--num_frames", default=32, type=int,
-                    help="Uniform-sampled frames per video. Trade-off: more frames "
-                         "= more image tokens = bigger LLM context. 32 frames at "
-                         "256 tokens/frame = 8192 image tokens.")
+    ap.add_argument("--n_total", default=N_TOTAL, type=int,
+                    help="Total token budget (paper default 16384)")
     ap.add_argument("--part", default=0, type=int)
     ap.add_argument("--num_parts", default=1, type=int)
     ap.add_argument("--gpu", default=0, type=int)
+    ap.add_argument("--batch_size", default=8, type=int)
     return ap.parse_args()
 
 
@@ -77,18 +76,17 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"loading Gemma3 from {args.model_local_path}...")
-    # NOTE: Use sdpa (PyTorch built-in scaled dot product attention) instead of
-    # flash_attention_2. flash-attn 2.7.2 (the version pinned by UniTime upstream)
-    # does not have an op-builder for Gemma3's SigLIP-2 vision tower architecture,
-    # which causes a hard segfault during model load. SDPA works for any
-    # architecture and is fast enough on H100 for offline feature extraction
-    # (28 videos × 32 frames = 896 forward passes).
     model = Gemma3VLMRForConditionalGeneration.from_pretrained(
         args.model_local_path,
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_local_path)
+
+    mm_tokens = getattr(model.config, "mm_tokens_per_image", 256)
+    max_frames = args.n_total // mm_tokens
+    max_frames = max_frames // FRAME_FACTOR * FRAME_FACTOR
+    print(f"mm_tokens_per_image={mm_tokens}, max_frames={max_frames} (budget {args.n_total})")
 
     valid_ext = (".mp4", ".avi", ".mkv", ".mov", ".webm")
     all_videos = sorted(
@@ -116,33 +114,42 @@ def main():
                 print(f"decord open failed for {video_path}: {ex}")
                 continue
 
-            total_frames = len(vr)
+            total_frames_vid = len(vr)
             video_fps = vr.get_avg_fps()
-            nframes = min(args.num_frames, total_frames)
-            frame_idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-            sample_fps = nframes / total_frames * video_fps
+
+            nframes = min(max_frames, total_frames_vid)
+            nframes = max(nframes // FRAME_FACTOR * FRAME_FACTOR, FRAME_FACTOR)
+
+            frame_idx = torch.linspace(0, total_frames_vid - 1, nframes).round().long().tolist()
+            sample_fps = nframes / total_frames_vid * video_fps
 
             try:
-                frames = vr.get_batch(frame_idx).asnumpy()
+                raw_frames = vr.get_batch(frame_idx).asnumpy()
             except Exception as ex:
                 print(f"decord read failed for {vid}: {ex}")
                 continue
 
-            # Convert to PIL → Gemma image processor → pixel_values
-            pil_frames = [Image.fromarray(f) for f in frames]
-            inputs = processor.image_processor(pil_frames, return_tensors="pt")
-            pixel_values = inputs["pixel_values"].to(device, dtype=torch.bfloat16)
-            # Gemma3 image processor may produce extra crops via pan_and_scan;
-            # we keep do_pan_and_scan=False (default) so num_crops == num_images.
+            pil_frames = [Image.fromarray(f) for f in raw_frames]
 
-            # Run vision_tower + multi_modal_projector
-            features = model.get_image_features(pixel_values).cpu()
-            # features shape: (nframes, mm_tokens_per_image=256, text_hidden=2560)
+            all_features = []
+            bs = args.batch_size
+            for bi in range(0, len(pil_frames), bs):
+                batch_pil = pil_frames[bi:bi + bs]
+                inputs = processor.image_processor(batch_pil, return_tensors="pt")
+                pixel_values = inputs["pixel_values"].to(device, dtype=torch.bfloat16)
+                feats = model.get_image_features(pixel_values).cpu()
+                all_features.append(feats)
+
+            features = torch.cat(all_features, dim=0)
+
+            fps_sample_idx = [int((x + y) / 2) for x, y in zip(frame_idx[::2], frame_idx[1::2])]
+
+            print(f"  {vid}: {nframes} frames × {mm_tokens} tokens = {nframes * mm_tokens}")
 
             torch.save(
                 {
                     "feature": features,
-                    "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
+                    "frame_idx": torch.tensor(fps_sample_idx, dtype=torch.long),
                     "sample_fps": float(sample_fps),
                 },
                 out_path,
