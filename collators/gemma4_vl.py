@@ -45,9 +45,9 @@ class Gemma4DataCollator(BaseDataCollator):
         self.mask_question_tokens = mask_question_tokens
 
         self.image_token_id = config.image_token_id
-        self.boi_token = "<start_of_image>"
-        self.eoi_token = "<end_of_image>"
-        self.image_token = "<image_soft_token>"
+        self.boi_token = tokenizer.convert_ids_to_tokens(config.boi_token_id)
+        self.eoi_token = tokenizer.convert_ids_to_tokens(config.eoi_token_id)
+        self.image_token = tokenizer.convert_ids_to_tokens(config.image_token_id)
 
     @property
     def PAD_TOKEN_ID(self) -> int:
@@ -94,11 +94,10 @@ class Gemma4DataCollator(BaseDataCollator):
     def build_full_prompt(self, user_text, target_text):
         bos = self.tokenizer.bos_token or ""
         prompt_text = (
-            f"{bos}\n"
-            f"<start_of_turn>user\n{user_text}<end_of_turn>\n"
-            f"<start_of_turn>model\n"
+            f"{bos}<|turn>user\n{user_text}<turn|>\n"
+            f"<|turn>model\n"
         )
-        target_with_eot = f"{target_text}<end_of_turn>\n"
+        target_with_eot = f"{target_text}<turn|>\n"
         prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         target_ids = self.tokenizer(target_with_eot, add_special_tokens=False)["input_ids"]
         input_ids = prompt_ids + target_ids

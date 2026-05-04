@@ -1,10 +1,6 @@
 """
 Extract Gemma4 vision features for UniTime training.
-
-Pipeline: 2fps dense sampling → vision encoder → token compression → save.
-Output: {feature: [N, H', W', D], frame_idx: [N], sample_fps: float}
-feature.shape[0] == frame_idx.shape[0] always.
-
+Pipeline: 2fps dense → vision encoder → token compression → save.
 Requires UniTime-gemma4 env (transformers >= 5.0).
 """
 import os
@@ -36,6 +32,15 @@ def resize_feature(feature, h, w):
     ).permute(0, 2, 3, 1)
 
 
+def find_hw(n):
+    """Find (h, w) factors of n closest to square."""
+    best = (1, n)
+    for i in range(2, int(math.sqrt(n)) + 1):
+        if n % i == 0:
+            best = (i, n // i)
+    return best
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video_root", required=True)
@@ -60,8 +65,10 @@ def main():
         args.model_local_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_local_path)
-    mm_tokens = getattr(model.config, "mm_tokens_per_image", 256)
-    mm_side = int(math.sqrt(mm_tokens))
+
+    mm_tokens = getattr(model.config, "vision_soft_tokens_per_image", 280)
+    mm_h, mm_w = find_hw(mm_tokens)
+    print(f"vision_soft_tokens_per_image={mm_tokens}, spatial={mm_h}x{mm_w}")
 
     videos = sorted(f for f in os.listdir(args.video_root)
                     if f.lower().endswith((".mp4", ".avi", ".mkv", ".mov")))
@@ -101,9 +108,11 @@ def main():
                 feats.append(out.pooler_output.cpu())
             feats = torch.cat(feats, dim=0)  # [nframes, mm_tokens, hidden]
 
-            res_side = max(int(math.sqrt(max(args.n_total // nframes, 4))), 2)
-            feats_4d = feats.reshape(nframes, mm_side, mm_side, -1)
-            feats_out = resize_feature(feats_4d, res_side, res_side)
+            # Token compression
+            n_res = max(args.n_total // nframes, 4)
+            res_h, res_w = find_hw(n_res) if n_res > 4 else (2, 2)
+            feats_4d = feats.reshape(nframes, mm_h, mm_w, -1)
+            feats_out = resize_feature(feats_4d, res_h, res_w)
 
             assert feats_out.shape[0] == len(frame_idx)
 
@@ -113,7 +122,7 @@ def main():
                 "sample_fps": float(sample_fps),
             }, out_path)
 
-            print(f"  {vid}: {nframes}fr, {mm_tokens}→{res_side**2}tok/fr, total={nframes*res_side**2}")
+            print(f"  {vid}: {nframes}fr, {mm_tokens}->{res_h}x{res_w}={res_h*res_w}tok/fr, total={nframes*res_h*res_w}")
 
 
 if __name__ == "__main__":
