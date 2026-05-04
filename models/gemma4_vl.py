@@ -92,8 +92,12 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 else attention_mask
             )
 
+            # Build mm_token_type_ids for PLE: 0=text, 1=image
+            if mm_token_type_ids is None:
+                mm_token_type_ids = (input_ids == image_token_id).long()
+
             return super().forward(
-                input_ids=None,
+                input_ids=input_ids,
                 inputs_embeds=inputs_embeds_local,
                 pixel_values=None,
                 pixel_values_videos=None,
