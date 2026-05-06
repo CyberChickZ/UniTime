@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Sequence
 
 import decord
 import torch
-import numpy as np
 from PIL import Image
 from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizer
 
@@ -34,8 +33,6 @@ class Gemma4TASDataCollator(BaseDataCollator):
         self.spatial_pool_grid = spatial_pool_grid
 
         self.image_token_id = config.image_token_id
-        self.boi_token = tokenizer.convert_ids_to_tokens(config.boi_token_id)
-        self.eoi_token = tokenizer.convert_ids_to_tokens(config.eoi_token_id)
 
     @property
     def PAD_TOKEN_ID(self) -> int:
@@ -50,38 +47,31 @@ class Gemma4TASDataCollator(BaseDataCollator):
         return [Image.fromarray(f) for f in frames]
 
     def _process_single(self, inst: Dict):
-        """Build input_ids, labels, and pixel_values for one instance."""
         context = inst["context"]
         gt_text = inst["gt_text"]
         timestamps = inst["frame_timestamps"]
         video_path = inst["video_path"]
         sample_indices = inst["sample_indices"]
 
-        # Read video frames
         frames = self._read_frames(video_path, sample_indices)
 
-        # Process each frame through image_processor to get pixel_values
         all_pixel_values = []
+        all_position_ids = []
         raw_tokens_per_image = None
         for img in frames:
             inputs = self.processor.image_processor([img], return_tensors="pt")
-            pv = inputs["pixel_values"]  # [1, n_tokens, patch_dim]
-            all_pixel_values.append(pv.squeeze(0))  # [n_tokens, patch_dim]
+            pv = inputs["pixel_values"].squeeze(0)
+            all_pixel_values.append(pv)
+            pos = inputs.get("image_position_ids")
+            if pos is not None:
+                all_position_ids.append(pos.squeeze(0))
             if raw_tokens_per_image is None:
-                raw_tokens_per_image = pv.shape[1]
+                raw_tokens_per_image = pv.shape[0]
 
         if self.spatial_pool_grid is not None:
             tokens_per_image = self.spatial_pool_grid[0] * self.spatial_pool_grid[1]
         else:
             tokens_per_image = raw_tokens_per_image
-
-        # Build token sequence:
-        # <bos><|turn>user\n
-        # Previous actions: take, open, put\n
-        # 0.0s \n\n<boi>[img×tpi]<eoi>\n\n 0.3s \n\n<boi>[img×tpi]<eoi>\n\n ...
-        # List all action segments with start and end timestamps.\n
-        # <turn|>\n<|turn>model\n
-        # {gt_text}<turn|>\n
 
         bos = self.tokenizer.bos_token or ""
         boi_id = self.config.boi_token_id
@@ -89,7 +79,6 @@ class Gemma4TASDataCollator(BaseDataCollator):
         img_tok = self.image_token_id
         newline_ids = self._tokenize("\n\n")
 
-        # Header
         if context:
             context_str = ", ".join(context)
             header_text = f"{bos}<|turn>user\nPrevious actions: {context_str}\n"
@@ -97,9 +86,8 @@ class Gemma4TASDataCollator(BaseDataCollator):
             header_text = f"{bos}<|turn>user\n"
         header_ids = self._tokenize(header_text)
 
-        # Interleaved timestamps + image tokens
         body_ids = []
-        for i, t in enumerate(timestamps):
+        for t in timestamps:
             body_ids.extend(self._tokenize(f"{t}s "))
             body_ids.extend(newline_ids)
             body_ids.append(boi_id)
@@ -107,7 +95,6 @@ class Gemma4TASDataCollator(BaseDataCollator):
             body_ids.append(eoi_id)
             body_ids.extend(newline_ids)
 
-        # Instruction
         instr_ids = self._tokenize(
             "List all action segments with start and end timestamps.\n"
         )
@@ -118,23 +105,24 @@ class Gemma4TASDataCollator(BaseDataCollator):
         input_ids = prompt_ids + target_ids
         labels = [PAD_IDX] * len(prompt_ids) + list(target_ids)
 
-        return input_ids, labels, all_pixel_values, tokens_per_image
+        return input_ids, labels, all_pixel_values, all_position_ids, tokens_per_image
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         all_input_ids = []
         all_labels = []
-        all_pixels = []  # list of list of [n_tokens, patch_dim]
+        all_pv = []
+        all_pos = []
         tpi = None
 
         for inst in instances:
-            input_ids, labels, pixel_values, tokens_per_image = self._process_single(inst)
+            input_ids, labels, pvs, pos_ids, tokens_per_image = self._process_single(inst)
             all_input_ids.append(input_ids)
             all_labels.append(labels)
-            all_pixels.append(pixel_values)
+            all_pv.extend(pvs)
+            all_pos.extend(pos_ids)
             if tpi is None:
                 tpi = tokens_per_image
 
-        # Pad to max length
         max_len = max(len(x) for x in all_input_ids)
         pad_id = self.PAD_TOKEN_ID
 
@@ -147,27 +135,22 @@ class Gemma4TASDataCollator(BaseDataCollator):
             labels_tensor[i, :len(lbls)] = torch.tensor(lbls, dtype=torch.long)
             attention_mask[i, :len(ids)] = 1
 
-        # Stack pixel values per frame: [n_raw_tokens, patch_dim]
-        # These are raw pixel_values — the model's get_image_features handles
-        # vision encoding and optional spatial pooling.
-        pixel_values_list = []
-        for pv_list in all_pixels:
-            for pv in pv_list:
-                pixel_values_list.append(pv)
-        pixel_values_stacked = torch.stack(pixel_values_list, dim=0)  # [N_total_frames, n_raw_tokens, patch_dim]
+        pixel_values = torch.stack(all_pv, dim=0)
 
-        # Verify: image token slots in input_ids must match post-pooling token count
         n_image_slots = (input_ids_tensor == self.image_token_id).sum().item()
-        expected_slots = len(pixel_values_list) * tpi  # tpi is post-pooling tokens_per_image
+        expected_slots = len(all_pv) * tpi
         if n_image_slots != expected_slots:
             raise RuntimeError(
                 f"image-token slots {n_image_slots} != expected {expected_slots} "
-                f"({len(pixel_values_list)} frames × {tpi} tokens/frame)"
+                f"({len(all_pv)} frames x {tpi} tokens/frame)"
             )
 
-        return dict(
+        result = dict(
             input_ids=input_ids_tensor,
             attention_mask=attention_mask,
             labels=labels_tensor,
-            pixel_values=pixel_values_stacked,
+            pixel_values=pixel_values,
         )
+        if all_pos:
+            result["image_position_ids"] = torch.stack(all_pos, dim=0)
+        return result

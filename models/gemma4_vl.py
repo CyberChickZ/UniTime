@@ -42,30 +42,35 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
     spatial_pool_grid: Optional[Tuple[int, int]] = None
 
     def set_spatial_pool(self, grid: Optional[Tuple[int, int]]):
-        """Set spatial pooling target grid. None = no pooling (default)."""
-        self.spatial_pool_grid = grid
+        """Set spatial pooling target grid. None = no pooling (default).
 
-    def get_image_features(self, pixel_values, image_position_ids=None, **kwargs):
-        out = self.model.get_image_features(pixel_values, image_position_ids, **kwargs)
-        if self.spatial_pool_grid is None:
-            return out
-        tgt_h, tgt_w = self.spatial_pool_grid
-        tgt_tokens = tgt_h * tgt_w
-        pooler = out.pooler_output  # [total_tokens_all_images, D]
-        D = pooler.shape[-1]
-        total = pooler.shape[0]
-        # Gemma4 image_processor produces fixed token count per image
-        # Detect tokens_per_image from the first image
-        # All images in a batch have the same token count
-        n_images = pixel_values.shape[0] if pixel_values.dim() >= 2 else 1
-        tpi = total // n_images
-        src_h, src_w = _find_hw(tpi)
-        chunks = pooler.reshape(n_images, src_h, src_w, D)
-        chunks = chunks.permute(0, 3, 1, 2)  # [N, D, src_h, src_w]
-        pooled = F.interpolate(chunks, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
-        pooled = pooled.permute(0, 2, 3, 1)  # [N, tgt_h, tgt_w, D]
-        out.pooler_output = pooled.reshape(n_images * tgt_tokens, D)
-        return out
+        Patches Gemma4Model.get_image_features so pooling happens inside
+        self.model.forward() where the base class calls it.
+        """
+        self.spatial_pool_grid = grid
+        if grid is not None:
+            _original = self.model.get_image_features.__func__
+            _self_ref = self
+
+            def _patched_get_image_features(model_self, pixel_values, image_position_ids=None, **kwargs):
+                out = _original(model_self, pixel_values, image_position_ids, **kwargs)
+                tgt_h, tgt_w = _self_ref.spatial_pool_grid
+                tgt_tokens = tgt_h * tgt_w
+                pooler = out.pooler_output
+                D = pooler.shape[-1]
+                total = pooler.shape[0]
+                n_images = pixel_values.shape[0] if pixel_values.dim() >= 2 else 1
+                tpi = total // n_images
+                src_h, src_w = _find_hw(tpi)
+                chunks = pooler.reshape(n_images, src_h, src_w, D)
+                chunks = chunks.permute(0, 3, 1, 2)
+                pooled = F.interpolate(chunks, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+                pooled = pooled.permute(0, 2, 3, 1)
+                out.pooler_output = pooled.reshape(n_images * tgt_tokens, D)
+                return out
+
+            import types
+            self.model.get_image_features = types.MethodType(_patched_get_image_features, self.model)
 
     def forward(
         self,
