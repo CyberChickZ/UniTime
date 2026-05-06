@@ -59,6 +59,9 @@ class GTEAWindowDataset(Dataset):
                 "total_frames": len(labels),
             })
 
+        # TrainerWithCustomSampler 需要此属性 (所有 entry 都有视频, 无纯文本)
+        self.is_text_only = [False] * len(self.entries)
+
     def _load_split(self, path: str) -> List[str]:
         with open(path) as f:
             return [line.strip().replace(".txt", "") for line in f if line.strip()]
