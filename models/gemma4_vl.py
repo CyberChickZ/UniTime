@@ -128,8 +128,11 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             if self.spatial_pool_grid is not None:
                 tgt_h, tgt_w = self.spatial_pool_grid
                 D = features.shape[-1]
-                raw_tpi = 2520  # Gemma4 固定 tokens per image
-                n_images = features.shape[0] // raw_tpi
+                # 从 input_ids 中的 image token 数和 pool 后 tpi 推算原始每帧 token 数
+                n_img_slots = image_mask_1d.sum().item()
+                tpi_pool = tgt_h * tgt_w
+                n_images = n_img_slots // tpi_pool
+                raw_tpi = features.shape[0] // n_images
                 chunks = features.reshape(n_images, raw_tpi, D)
                 src_h, src_w = _find_hw(raw_tpi)
                 chunks = chunks.reshape(n_images, src_h, src_w, D).permute(0, 3, 1, 2)
