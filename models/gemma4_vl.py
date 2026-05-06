@@ -15,9 +15,11 @@ exists in transformers >= 5.0. The collators/__init__ and loaders/__init__
 guard the imports of this module so that the older UniTime env (transformers
 4.51 + Gemma 3 wrapper) keeps working.
 """
+import math
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
@@ -26,8 +28,44 @@ from transformers.cache_utils import Cache
 from transformers.models.gemma4.modeling_gemma4 import Gemma4CausalLMOutputWithPast
 
 
+def _find_hw(n):
+    best = (1, n)
+    for i in range(2, int(math.sqrt(n)) + 1):
+        if n % i == 0:
+            best = (i, n // i)
+    return best
+
+
 class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
-    """Gemma4-VL with UniTime additions: cached features + multi-qa mask."""
+    """Gemma4-VL with UniTime additions: cached features + multi-qa mask + spatial pooling."""
+
+    spatial_pool_grid: Optional[Tuple[int, int]] = None
+
+    def set_spatial_pool(self, grid: Optional[Tuple[int, int]]):
+        """Set spatial pooling target grid. None = no pooling (default)."""
+        self.spatial_pool_grid = grid
+
+    def get_image_features(self, pixel_values, image_position_ids=None, **kwargs):
+        out = self.model.get_image_features(pixel_values, image_position_ids, **kwargs)
+        if self.spatial_pool_grid is None:
+            return out
+        tgt_h, tgt_w = self.spatial_pool_grid
+        tgt_tokens = tgt_h * tgt_w
+        pooler = out.pooler_output  # [total_tokens_all_images, D]
+        D = pooler.shape[-1]
+        total = pooler.shape[0]
+        # Gemma4 image_processor produces fixed token count per image
+        # Detect tokens_per_image from the first image
+        # All images in a batch have the same token count
+        n_images = pixel_values.shape[0] if pixel_values.dim() >= 2 else 1
+        tpi = total // n_images
+        src_h, src_w = _find_hw(tpi)
+        chunks = pooler.reshape(n_images, src_h, src_w, D)
+        chunks = chunks.permute(0, 3, 1, 2)  # [N, D, src_h, src_w]
+        pooled = F.interpolate(chunks, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+        pooled = pooled.permute(0, 2, 3, 1)  # [N, tgt_h, tgt_w, D]
+        out.pooler_output = pooled.reshape(n_images * tgt_tokens, D)
+        return out
 
     def forward(
         self,

@@ -17,6 +17,7 @@ from .gemma3_vl import Gemma3DataCollator
 # it so the older paths keep working.
 try:
     from .gemma4_vl import Gemma4DataCollator  # noqa: F401
+    from .gemma4_tas import Gemma4TASDataCollator  # noqa: F401
 except ImportError:
     pass
 
