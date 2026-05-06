@@ -101,12 +101,10 @@ def train():
     if training_args.gradient_checkpointing:
         model.enable_input_require_grads()
 
-    # 设置 spatial pooling (默认不做, 传入 h>0 && w>0 时启用)
+    # spatial pooling grid (稍后在 peft 包装之后再 set)
     spatial_pool_grid = None
     if tas_args.spatial_pool_h > 0 and tas_args.spatial_pool_w > 0:
         spatial_pool_grid = (tas_args.spatial_pool_h, tas_args.spatial_pool_w)
-        model.set_spatial_pool(spatial_pool_grid)
-        rank0_print(f"Spatial pooling: {spatial_pool_grid}")
 
     # 冻结 vision encoder / projector
     vision_encoder_keys = MODULE_KEYWORDS[model_family_id]["vision_encoder"]
@@ -147,6 +145,12 @@ def train():
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config)
+
+    # 设置 spatial pooling (必须在 peft 包装之后, 否则 monkey-patch 会丢失)
+    if spatial_pool_grid is not None:
+        base = model.base_model.model if hasattr(model, "base_model") else model
+        base.set_spatial_pool(spatial_pool_grid)
+        rank0_print(f"Spatial pooling: {spatial_pool_grid}")
 
     # 加载数据
     rank0_print("Loading data...")
