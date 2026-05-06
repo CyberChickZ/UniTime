@@ -34,6 +34,7 @@ class ModelArguments:
 class DataArguments:
     video_folder: str = field(default=None)        # 视频目录
     gt_folder: str = field(default=None)            # groundTruth/*.txt 逐帧标注
+    feat_folder: Optional[str] = field(default=None)  # 预提取 feature 目录 (.pt)
     train_split: str = field(default=None)          # split bundle 文件
     test_split: Optional[str] = field(default=None)
 
@@ -158,6 +159,7 @@ def train():
         video_folder=data_args.video_folder,
         gt_folder=data_args.gt_folder,
         split_file=data_args.train_split,
+        feat_folder=data_args.feat_folder,
         split="train",
     )
     rank0_print(f"Train: {len(train_dataset)} videos")
@@ -168,6 +170,7 @@ def train():
             video_folder=data_args.video_folder,
             gt_folder=data_args.gt_folder,
             split_file=data_args.test_split,
+            feat_folder=data_args.feat_folder,
             split="val",
         )
         rank0_print(f"Val: {len(val_dataset)} videos")

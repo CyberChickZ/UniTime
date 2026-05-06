@@ -1,7 +1,10 @@
 """Gemma4 Collator — Temporal Action Segmentation 滑窗训练.
 
-在线 pixel-values 路径: 用 decord 读视频帧 → 传原始像素给模型.
-模型的 forward 负责 vision encoding + 可选 spatial pooling.
+两种路径:
+  1. Cached features: 从 .pt 加载预提取的 [T, 2520, 2560] features, 按 sample_indices 切片
+  2. Online pixels: decord 读帧 → image_processor (fallback, 需要更多显存)
+
+模型的 forward (feature_inputs path) 负责 spatial pooling.
 
 Token 序列结构:
   <bos><|turn>user
@@ -11,14 +14,11 @@ Token 序列结构:
   <turn|><|turn>model
   take 0.0 1.7, open 2.3 6.0, ...<turn|>
 
-其中 tpi = spatial_pool_grid[0] * spatial_pool_grid[1] (如 12×12=144),
-若未设置 spatial pooling 则 tpi = 原始 vision encoder 输出的 token 数.
+tpi = spatial_pool_grid[0] * spatial_pool_grid[1] (如 12×12=144).
 """
 from typing import Dict, List, Optional, Sequence
 
-import decord
 import torch
-from PIL import Image
 from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizer
 
 from . import register_collator
@@ -52,43 +52,31 @@ class Gemma4TASDataCollator(BaseDataCollator):
     def _tokenize(self, text):
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    def _read_frames(self, video_path: str, indices: List[int]) -> List[Image.Image]:
-        """用 decord 按帧索引读取视频帧, 返回 PIL Image 列表."""
-        vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
-        frames = vr.get_batch(indices).asnumpy()
-        return [Image.fromarray(f) for f in frames]
+    def _load_features(self, feat_path: str, sample_indices: List[int]) -> torch.Tensor:
+        """从 .pt 加载预提取 features, 按 sample_indices 切片.
+        返回 [n_frames, 2520, D] (不做 spatial pooling, 留给模型 forward).
+        """
+        data = torch.load(feat_path, map_location="cpu", weights_only=False)
+        feature = data["feature"]  # [T_total, 2520, D]
+        return feature[sample_indices]  # [90, 2520, D]
 
     def _process_single(self, inst: Dict):
-        """处理单条数据: 读帧 → image_processor → 构造 input_ids + labels."""
+        """处理单条数据: 加载 features → 构造 input_ids + labels."""
         context = inst["context"]
         gt_text = inst["gt_text"]
         timestamps = inst["frame_timestamps"]
-        video_path = inst["video_path"]
+        feat_path = inst["feat_path"]
         sample_indices = inst["sample_indices"]
 
-        # 读视频帧
-        frames = self._read_frames(video_path, sample_indices)
+        # 加载预提取 features
+        features = self._load_features(feat_path, sample_indices)  # [90, 2520, D]
+        tokens_per_image_raw = features.shape[1]  # 2520
 
-        # 逐帧过 image_processor, 得到 pixel_values + position_ids
-        all_pixel_values = []
-        all_position_ids = []
-        raw_tokens_per_image = None
-        for img in frames:
-            inputs = self.processor.image_processor([img], return_tensors="pt")
-            pv = inputs["pixel_values"].squeeze(0)   # [n_tokens, patch_dim]
-            all_pixel_values.append(pv)
-            pos = inputs.get("image_position_ids")
-            if pos is not None:
-                all_position_ids.append(pos.squeeze(0))  # [n_tokens, 2]
-            if raw_tokens_per_image is None:
-                raw_tokens_per_image = pv.shape[0]
-
-        # 每帧在 input_ids 中占的 image token 数
-        # 如果有 spatial pooling, 用 pool 后的 token 数; 否则用原始数
+        # 每帧在 input_ids 中占的 image token 数 (pool 后)
         if self.spatial_pool_grid is not None:
             tokens_per_image = self.spatial_pool_grid[0] * self.spatial_pool_grid[1]
         else:
-            tokens_per_image = raw_tokens_per_image
+            tokens_per_image = tokens_per_image_raw
 
         # 构造 token 序列
         bos = self.tokenizer.bos_token or ""
@@ -129,21 +117,19 @@ class Gemma4TASDataCollator(BaseDataCollator):
         input_ids = prompt_ids + target_ids
         labels = [PAD_IDX] * len(prompt_ids) + list(target_ids)
 
-        return input_ids, labels, all_pixel_values, all_position_ids, tokens_per_image
+        return input_ids, labels, features, tokens_per_image
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         all_input_ids = []
         all_labels = []
-        all_pv = []       # 所有帧的 pixel_values, 展平
-        all_pos = []      # 所有帧的 position_ids, 展平
+        all_features = []  # 每个 instance 的 [90, 2520, D]
         tpi = None
 
         for inst in instances:
-            input_ids, labels, pvs, pos_ids, tokens_per_image = self._process_single(inst)
+            input_ids, labels, features, tokens_per_image = self._process_single(inst)
             all_input_ids.append(input_ids)
             all_labels.append(labels)
-            all_pv.extend(pvs)
-            all_pos.extend(pos_ids)
+            all_features.append(features)
             if tpi is None:
                 tpi = tokens_per_image
 
@@ -160,25 +146,26 @@ class Gemma4TASDataCollator(BaseDataCollator):
             labels_tensor[i, :len(lbls)] = torch.tensor(lbls, dtype=torch.long)
             attention_mask[i, :len(ids)] = 1
 
-        # pixel_values: [总帧数, 原始token数, patch_dim]
-        # 传给模型, vision encoder + spatial pooling 在 forward 里做
-        pixel_values = torch.stack(all_pv, dim=0)
+        # feature_inputs: concat 所有帧的 features → [total_frames * 2520, D]
+        # 模型 forward 的 feature_inputs path 期望 2D [N_tokens, D]
+        # spatial pooling 在 forward 里做 (需要知道每帧 2520 tokens 来 reshape)
+        feature_concat = torch.cat(
+            [f.reshape(-1, f.shape[-1]) for f in all_features], dim=0
+        )
 
-        # 验证: input_ids 中的 image token 数 == 帧数 × pool后每帧token数
+        # 验证: input_ids 中的 image token 数
         n_image_slots = (input_ids_tensor == self.image_token_id).sum().item()
-        expected_slots = len(all_pv) * tpi
+        total_frames = sum(f.shape[0] for f in all_features)
+        expected_slots = total_frames * tpi
         if n_image_slots != expected_slots:
             raise RuntimeError(
                 f"image-token slots {n_image_slots} != expected {expected_slots} "
-                f"({len(all_pv)} frames x {tpi} tokens/frame)"
+                f"({total_frames} frames x {tpi} tokens/frame)"
             )
 
-        result = dict(
+        return dict(
             input_ids=input_ids_tensor,
             attention_mask=attention_mask,
             labels=labels_tensor,
-            pixel_values=pixel_values,
+            feature_inputs=feature_concat,
         )
-        if all_pos:
-            result["image_position_ids"] = torch.stack(all_pos, dim=0)
-        return result

@@ -120,23 +120,36 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             pad_token_id = self.config.text_config.pad_token_id
             image_mask_1d = (input_ids == image_token_id)
 
+            # Spatial pooling: 在 scatter 之前对 feature_inputs 做 pool
+            features = feature_inputs.to(
+                self.get_input_embeddings().weight.device,
+                self.get_input_embeddings().weight.dtype,
+            )
+            if self.spatial_pool_grid is not None:
+                tgt_h, tgt_w = self.spatial_pool_grid
+                D = features.shape[-1]
+                raw_tpi = 2520  # Gemma4 固定 tokens per image
+                n_images = features.shape[0] // raw_tpi
+                chunks = features.reshape(n_images, raw_tpi, D)
+                src_h, src_w = _find_hw(raw_tpi)
+                chunks = chunks.reshape(n_images, src_h, src_w, D).permute(0, 3, 1, 2)
+                pooled = F.interpolate(chunks, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+                features = pooled.permute(0, 2, 3, 1).reshape(n_images * tgt_h * tgt_w, D)
+
             # 1) Replace image tokens with PAD for clean embedding + PLE
             llm_input_ids = input_ids.clone()
             llm_input_ids[image_mask_1d] = pad_token_id
             inputs_embeds_local = self.get_input_embeddings()(llm_input_ids)
 
-            # 2) Compute PLE from the PAD-replaced IDs (matches base class logic)
-            #    self.model = Gemma4MultiModalModel
-            #    self.model.language_model = Gemma4Model (text backbone with PLE)
-            lm = self.model.language_model
+            # 2) Compute PLE
+            lm = self._mm_model.language_model if self._mm_model else self.model.language_model
             per_layer_inputs = None
             if getattr(lm, "hidden_size_per_layer_input", 0):
                 per_layer_inputs = lm.get_per_layer_inputs(llm_input_ids, inputs_embeds_local)
                 per_layer_inputs = lm.project_per_layer_inputs(inputs_embeds_local, per_layer_inputs)
 
-            # 3) Scatter cached features into the embedding
+            # 3) Scatter features into the embedding
             image_mask = image_mask_1d.unsqueeze(-1).expand_as(inputs_embeds_local)
-            features = feature_inputs.to(inputs_embeds_local.device, inputs_embeds_local.dtype)
             if inputs_embeds_local[image_mask].numel() != features.numel():
                 n_img = image_mask_1d.sum().item()
                 raise ValueError(
@@ -151,8 +164,7 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 else attention_mask
             )
 
-            # 4) Call Gemma4Model directly (bypass MultiModalModel + ConditionalGen
-            #    layers that enforce XOR checks and do their own PLE)
+            # 4) Call LLM directly (绕过 MultiModalModel)
             lm_out = lm(
                 input_ids=None,
                 inputs_embeds=inputs_embeds_local,
@@ -165,16 +177,21 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             )
             hidden_states = lm_out.last_hidden_state
 
+            # 5) Sparse loss: 只在 labels != -100 的 GT 部分算 logits
             loss = None
-            logits = self.lm_head(hidden_states[:, -logits_to_keep:, :])
             if labels is not None:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                n_gt = (labels[0] != -100).sum().item()
+                gt_hidden = hidden_states[:, -(n_gt + 1):-1, :]
+                gt_logits = self.lm_head(gt_hidden)
+                gt_labels = labels[:, -n_gt:]
                 loss = nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
+                    gt_logits.reshape(-1, gt_logits.size(-1)),
+                    gt_labels.reshape(-1),
                     ignore_index=-100,
                 )
+                logits = gt_logits[:, -1:, :]
+            else:
+                logits = self.lm_head(hidden_states[:, -1:, :])
 
             return Gemma4CausalLMOutputWithPast(
                 loss=loss,

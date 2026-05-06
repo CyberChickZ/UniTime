@@ -29,11 +29,13 @@ class GTEAWindowDataset(Dataset):
         video_folder: str,
         gt_folder: str,
         split_file: str,
+        feat_folder: Optional[str] = None,
         split: str = "train",
     ) -> None:
         super().__init__()
         self.video_folder = video_folder
         self.gt_folder = gt_folder
+        self.feat_folder = feat_folder
         self.split = split
 
         video_ids = self._load_split(split_file)
@@ -52,9 +54,15 @@ class GTEAWindowDataset(Dataset):
                     break
             if video_path is None:
                 continue
+            feat_path = None
+            if feat_folder:
+                fp = os.path.join(feat_folder, f"{vid}.pt")
+                if os.path.exists(fp):
+                    feat_path = fp
             self.entries.append({
                 "id": vid,
                 "video_path": video_path,
+                "feat_path": feat_path,
                 "labels": labels,          # 逐帧标签 (原始 15fps)
                 "total_frames": len(labels),
             })
@@ -140,9 +148,10 @@ class GTEAWindowDataset(Dataset):
         return {
             "id": entry["id"],
             "video_path": entry["video_path"],
-            "sample_indices": sample_indices,    # 90 个原始帧索引 (整数)
-            "context": context_dedup,            # 前文 action 序列
-            "gt_text": gt_text,                  # COIN 格式 GT
-            "frame_timestamps": frame_timestamps,# 每帧相对时间 [0.0, 0.3, ..., 29.7]
+            "feat_path": entry.get("feat_path"),  # 预提取 feature 路径 (可选)
+            "sample_indices": sample_indices,      # 90 个原始帧索引 (整数)
+            "context": context_dedup,              # 前文 action 序列
+            "gt_text": gt_text,                    # COIN 格式 GT
+            "frame_timestamps": frame_timestamps,  # 每帧相对时间 [0.0, 0.3, ..., 29.7]
             "split": self.split,
         }
