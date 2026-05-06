@@ -1,3 +1,11 @@
+"""TAS 滑窗训练入口.
+
+与 UniTime 原版 train.py 的区别:
+  - Dataset: GTEAWindowDataset (随机 30s 窗口, 逐帧 GT)
+  - Collator: Gemma4TASDataCollator (在线 pixel values, 交错 timestamp-image)
+  - Model: Gemma4VLMRForConditionalGeneration + set_spatial_pool()
+  - 训练方式 (loss, LoRA, Trainer) 与 UniTime 一致
+"""
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,14 +32,14 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    video_folder: str = field(default=None)
-    gt_folder: str = field(default=None)
-    train_split: str = field(default=None)
+    video_folder: str = field(default=None)        # 视频目录
+    gt_folder: str = field(default=None)            # groundTruth/*.txt 逐帧标注
+    train_split: str = field(default=None)          # split bundle 文件
     test_split: Optional[str] = field(default=None)
 
 @dataclass
 class TASArguments:
-    spatial_pool_h: int = field(default=0)
+    spatial_pool_h: int = field(default=0)  # 0 表示不做 spatial pooling
     spatial_pool_w: int = field(default=0)
 
 @dataclass
@@ -63,6 +71,7 @@ def train():
     )
     model_args, data_args, tas_args, training_args, lora_args = parser.parse_args_into_dataclasses()
 
+    # 保存所有参数到 output_dir/arguments/
     output_dir = training_args.output_dir
     args_dir = Path(output_dir) / "arguments"
     args_dir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +85,7 @@ def train():
 
     model_family_id = "gemma4"
 
-    # Load model
+    # 加载模型
     rank0_print("Loading model...")
     loader = LOADERS[model_family_id](
         model_hf_path=model_args.model_id,
@@ -92,14 +101,14 @@ def train():
     if training_args.gradient_checkpointing:
         model.enable_input_require_grads()
 
-    # Spatial pooling
+    # 设置 spatial pooling (默认不做, 传入 h>0 && w>0 时启用)
     spatial_pool_grid = None
     if tas_args.spatial_pool_h > 0 and tas_args.spatial_pool_w > 0:
         spatial_pool_grid = (tas_args.spatial_pool_h, tas_args.spatial_pool_w)
         model.set_spatial_pool(spatial_pool_grid)
         rank0_print(f"Spatial pooling: {spatial_pool_grid}")
 
-    # Freeze vision encoder / projector
+    # 冻结 vision encoder / projector
     vision_encoder_keys = MODULE_KEYWORDS[model_family_id]["vision_encoder"]
     if not training_args.train_vision_encoder:
         rank0_print("Freezing vision encoder:")
@@ -118,7 +127,7 @@ def train():
         for other_key in MODULE_KEYWORDS[model_family_id]["others"]:
             eval(f"model.{other_key}").requires_grad_(False)
 
-    # LoRA
+    # LoRA (仅 LLM)
     llm_keys = MODULE_KEYWORDS[model_family_id]["llm"]
     if lora_args.use_lora:
         rank0_print("LoRA for LLM enabled")
@@ -139,7 +148,7 @@ def train():
         )
         model = get_peft_model(model, lora_config)
 
-    # Datasets
+    # 加载数据
     rank0_print("Loading data...")
     train_dataset = GTEAWindowDataset(
         video_folder=data_args.video_folder,
@@ -170,7 +179,7 @@ def train():
         spatial_pool_grid=spatial_pool_grid,
     )
 
-    # Trainer
+    # Trainer (和 UniTime 一致: HF Trainer + DeepSpeed ZeRO-2)
     training_args.label_names = "labels"
     trainer = TrainerWithCustomSampler(
         model=model,

@@ -1,3 +1,13 @@
+"""GTEA 滑窗 Temporal Action Segmentation Dataset.
+
+每次 __getitem__ 从一个视频中随机取 30s 窗口，返回:
+  - context: 窗口前的 action 序列 (去 background, 去重连续)
+  - gt_text: 窗口内的 action segments (COIN 格式, 相对时间)
+  - sample_indices: 90 个采样帧的原始帧索引
+
+全部帧索引运算为整数，避免浮点精度问题。
+时间只在最后生成 GT 文本时才从整数帧偏移转为 float: round(offset / fps, 1)。
+"""
 import os
 import random
 from typing import Dict, List, Optional
@@ -6,19 +16,13 @@ from torch.utils.data import Dataset
 
 
 class GTEAWindowDataset(Dataset):
-    """GTEA Temporal Action Segmentation with sliding window.
 
-    Each __getitem__ returns a random 30s window from one video,
-    with context (previous action sequence) and GT segments.
-    All frame indexing is integer-only to avoid floating point issues.
-    """
-
-    ORIGINAL_FPS = 15
-    SAMPLE_FPS = 3
-    STEP = ORIGINAL_FPS // SAMPLE_FPS  # 5
-    WINDOW_SEC = 30
-    WINDOW_FRAMES = ORIGINAL_FPS * WINDOW_SEC  # 450
-    N_SAMPLE_FRAMES = SAMPLE_FPS * WINDOW_SEC  # 90
+    ORIGINAL_FPS = 15        # GTEA 原始视频帧率
+    SAMPLE_FPS = 3           # 采样帧率
+    STEP = ORIGINAL_FPS // SAMPLE_FPS  # = 5, 原始帧里每5帧取1帧
+    WINDOW_SEC = 30          # 窗口长度 (秒)
+    WINDOW_FRAMES = ORIGINAL_FPS * WINDOW_SEC  # = 450, 窗口在原始帧下的长度
+    N_SAMPLE_FRAMES = SAMPLE_FPS * WINDOW_SEC  # = 90, 窗口内采样帧数
 
     def __init__(
         self,
@@ -37,6 +41,7 @@ class GTEAWindowDataset(Dataset):
         for vid in video_ids:
             gt_path = os.path.join(gt_folder, f"{vid}.txt")
             labels = self._load_gt(gt_path)
+            # 视频必须 >= 30s (450 帧 @15fps)
             if len(labels) < self.WINDOW_FRAMES:
                 continue
             video_path = None
@@ -50,7 +55,7 @@ class GTEAWindowDataset(Dataset):
             self.entries.append({
                 "id": vid,
                 "video_path": video_path,
-                "labels": labels,
+                "labels": labels,          # 逐帧标签 (原始 15fps)
                 "total_frames": len(labels),
             })
 
@@ -70,17 +75,17 @@ class GTEAWindowDataset(Dataset):
         labels = entry["labels"]
         total_frames = entry["total_frames"]
 
-        # Step 1: random window start (integer frame index)
+        # Step 1: 随机窗口起点 (整数帧索引)
         max_s = total_frames - self.WINDOW_FRAMES
         s_frame = random.randint(0, max_s)
 
-        # Step 2: sample indices (all integers)
+        # Step 2: 90 个采样帧索引 (全整数: s_frame + i * 5)
         sample_indices = [s_frame + i * self.STEP for i in range(self.N_SAMPLE_FRAMES)]
 
-        # Step 3: GT labels for sampled frames
+        # Step 3: 查每个采样帧的 GT 标签
         sampled_labels = [labels[idx] for idx in sample_indices]
 
-        # Step 4: merge consecutive same labels → segments (integer offsets)
+        # Step 4: 合并连续相同标签 → segments (帧偏移, 整数)
         segments_raw = []
         current = sampled_labels[0]
         start_i = 0
@@ -88,8 +93,8 @@ class GTEAWindowDataset(Dataset):
             if sampled_labels[i] != current:
                 segments_raw.append({
                     "label": current,
-                    "start_offset": start_i * self.STEP,
-                    "end_offset": (i - 1) * self.STEP,
+                    "start_offset": start_i * self.STEP,      # 整数
+                    "end_offset": (i - 1) * self.STEP,        # 整数
                 })
                 current = sampled_labels[i]
                 start_i = i
@@ -99,7 +104,8 @@ class GTEAWindowDataset(Dataset):
             "end_offset": (self.N_SAMPLE_FRAMES - 1) * self.STEP,
         })
 
-        # Step 5: GT text — drop background, relative time, COIN format
+        # Step 5: 生成 GT 文本 — 去 background, 相对时间, COIN 格式
+        # 时间 = round(帧偏移 / 原始fps, 1), 范围 [0, 29.7]
         gt_segments = []
         for seg in segments_raw:
             if seg["label"] == "background":
@@ -114,7 +120,7 @@ class GTEAWindowDataset(Dataset):
         if not gt_text:
             gt_text = "none"
 
-        # Step 6: context — actions before window, drop background, dedup consecutive
+        # Step 6: 前文 context — 窗口前的 action 序列, 去 background, 去重连续
         context_indices = list(range(0, s_frame, self.STEP))
         context_dedup = []
         for ci in context_indices:
@@ -122,7 +128,7 @@ class GTEAWindowDataset(Dataset):
             if lab != "background" and (not context_dedup or context_dedup[-1] != lab):
                 context_dedup.append(lab)
 
-        # Step 7: per-frame relative timestamps (only computed here, from integers)
+        # Step 7: 每帧相对时间戳 (只在此处从整数算出, 用于 collator 交错)
         frame_timestamps = [
             round(i * self.STEP / self.ORIGINAL_FPS, 1)
             for i in range(self.N_SAMPLE_FRAMES)
@@ -131,9 +137,9 @@ class GTEAWindowDataset(Dataset):
         return {
             "id": entry["id"],
             "video_path": entry["video_path"],
-            "sample_indices": sample_indices,
-            "context": context_dedup,
-            "gt_text": gt_text,
-            "frame_timestamps": frame_timestamps,
+            "sample_indices": sample_indices,    # 90 个原始帧索引 (整数)
+            "context": context_dedup,            # 前文 action 序列
+            "gt_text": gt_text,                  # COIN 格式 GT
+            "frame_timestamps": frame_timestamps,# 每帧相对时间 [0.0, 0.3, ..., 29.7]
             "split": self.split,
         }
