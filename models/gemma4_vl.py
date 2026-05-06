@@ -179,49 +179,8 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 past_key_values=lm_out.past_key_values,
             )
 
-        # Pixel-values path: 走 _mm_model (Gemma4MultiModalModel) 做 vision + LLM forward，
-        # 但不用 base class 的 loss（它对整个 seq_len 算 logits 会 OOM）。
-        # 只对 labels != -100 的 GT 部分算 lm_head + cross-entropy。
-        # 用 _mm_model 直接引用原始 model, 绕过 peft 对 self.model 的劫持。
-        if labels is not None and pixel_values is not None and self._mm_model is not None:
-            outputs = self._mm_model(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                input_features=input_features,
-                attention_mask=attention_mask,
-                input_features_mask=input_features_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                image_position_ids=image_position_ids,
-                video_position_ids=video_position_ids,
-                return_dict=True,
-                **kwargs,
-            )
-            hidden_states = outputs.last_hidden_state
-
-            # 只在有标签的位置算 logits (省 ~13 GB 显存)
-            label_mask = (labels[0] != -100)
-            n_gt = label_mask.sum().item()
-            gt_hidden = hidden_states[:, -(n_gt + 1):-1, :]
-            gt_logits = self.lm_head(gt_hidden)
-            gt_labels = labels[:, -n_gt:]
-            loss = nn.functional.cross_entropy(
-                gt_logits.reshape(-1, gt_logits.size(-1)),
-                gt_labels.reshape(-1),
-                ignore_index=-100,
-            )
-
-            return Gemma4CausalLMOutputWithPast(
-                loss=loss,
-                logits=gt_logits[:, -1:, :],
-                past_key_values=outputs.past_key_values,
-            )
-
-        # Pass-through (无 labels 的推理路径)
+        # Pixel-values path: 直接走 base class forward
+        # H200 (141GB) 上 logits OOM 不是问题, 不需要 sparse loss
         return super().forward(
             input_ids=input_ids,
             pixel_values=pixel_values,
