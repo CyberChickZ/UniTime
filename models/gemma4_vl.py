@@ -179,8 +179,32 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 past_key_values=lm_out.past_key_values,
             )
 
+        # Generate 后续迭代 (feature_inputs=None, 有 KV cache):
+        # 走 lm_raw 保持和第1次 forward 一致的代码路径
+        if past_key_values is not None and feature_inputs is None:
+            mm = self._mm_model if self._mm_model else self.model
+            lm_raw = mm.language_model
+            inputs_embeds_local = self.get_input_embeddings()(input_ids)
+            per_layer_inputs = None
+            if getattr(lm_raw, "hidden_size_per_layer_input", 0):
+                per_layer_inputs = lm_raw.get_per_layer_inputs(input_ids, inputs_embeds_local)
+                per_layer_inputs = lm_raw.project_per_layer_inputs(inputs_embeds_local, per_layer_inputs)
+            lm_out = lm_raw(
+                input_ids=None,
+                inputs_embeds=inputs_embeds_local,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                per_layer_inputs=per_layer_inputs,
+                use_cache=use_cache,
+                **kwargs,
+            )
+            logits = self.lm_head(lm_out.last_hidden_state)
+            return Gemma4CausalLMOutputWithPast(
+                loss=None, logits=logits, past_key_values=lm_out.past_key_values,
+            )
+
         # Pixel-values path: 直接走 base class forward
-        # H200 (141GB) 上 logits OOM 不是问题, 不需要 sparse loss
         return super().forward(
             input_ids=input_ids,
             pixel_values=pixel_values,
