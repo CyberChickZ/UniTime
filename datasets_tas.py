@@ -20,9 +20,9 @@ class GTEAWindowDataset(Dataset):
     ORIGINAL_FPS = 15        # GTEA 原始视频帧率
     SAMPLE_FPS = 3           # 采样帧率
     STEP = ORIGINAL_FPS // SAMPLE_FPS  # = 5, 原始帧里每5帧取1帧
-    WINDOW_SEC = 30          # 窗口长度 (秒)
-    WINDOW_FRAMES = ORIGINAL_FPS * WINDOW_SEC  # = 450, 窗口在原始帧下的长度
-    N_SAMPLE_FRAMES = SAMPLE_FPS * WINDOW_SEC  # = 90, 窗口内采样帧数
+    WINDOW_SEC = 20          # 窗口长度 (秒)
+    WINDOW_FRAMES = ORIGINAL_FPS * WINDOW_SEC  # = 300, 窗口在原始帧下的长度
+    N_SAMPLE_FRAMES = SAMPLE_FPS * WINDOW_SEC  # = 60, 窗口内采样帧数
 
     def __init__(
         self,
