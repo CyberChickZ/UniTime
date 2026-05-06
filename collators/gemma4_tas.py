@@ -81,13 +81,12 @@ class Gemma4TASDataCollator(BaseDataCollator):
         raw_tpi = pixel_values.shape[1]  # 原始 vision encoder 输入 patch 数
         return pixel_values, position_ids, raw_tpi
 
-    def _build_token_sequence(self, context, timestamps, tokens_per_image, gt_text):
-        """构造 input_ids + labels."""
+    def _build_token_sequence(self, context, n_frames, tokens_per_image, gt_text):
+        """构造 input_ids + labels. 不加时间戳, 模型自己学时间."""
         bos = self.tokenizer.bos_token or ""
         boi_id = self.config.boi_token_id
         eoi_id = self.config.eoi_token_id
         img_tok = self.image_token_id
-        newline_ids = self._tokenize("\n\n")
 
         if context:
             header = self._tokenize(f"{bos}<|turn>user\nPrevious actions: {', '.join(context)}\n")
@@ -95,15 +94,12 @@ class Gemma4TASDataCollator(BaseDataCollator):
             header = self._tokenize(f"{bos}<|turn>user\n")
 
         body = []
-        for t in timestamps:
-            body.extend(self._tokenize(f"{t}s "))
-            body.extend(newline_ids)
+        for _ in range(n_frames):
             body.append(boi_id)
             body.extend([img_tok] * tokens_per_image)
             body.append(eoi_id)
-            body.extend(newline_ids)
 
-        instr = self._tokenize("List all action segments with start and end timestamps.\n")
+        instr = self._tokenize("\nList all action segments with start and end timestamps.\n")
         turn = self._tokenize("<turn|>\n<|turn>model\n")
         target = self._tokenize(f"{gt_text}<turn|>\n")
 
@@ -117,29 +113,25 @@ class Gemma4TASDataCollator(BaseDataCollator):
         feat_path = inst.get("feat_path")
         use_cached = feat_path is not None
 
+        n_frames = len(inst["sample_indices"])
+
         if use_cached:
-            # Cached features 路径
             features = self._load_features(feat_path, inst["sample_indices"])
             tpi = features.shape[1]
             input_ids, labels = self._build_token_sequence(
-                inst["context"], inst["frame_timestamps"], tpi, inst["gt_text"]
+                inst["context"], n_frames, tpi, inst["gt_text"]
             )
             return {"input_ids": input_ids, "labels": labels, "feature_inputs": features, "mode": "cached"}
         else:
-            # Online pixels 路径
             pixel_values, position_ids, raw_tpi = self._load_pixels(
                 inst["video_path"], inst["sample_indices"]
             )
-            # pool 后的 tpi 决定 input_ids 中的 image token 数
             if self.spatial_pool_grid is not None:
                 tpi = self.spatial_pool_grid[0] * self.spatial_pool_grid[1]
             else:
-                # 在线路径 pooler_output 是 264 tokens (vision tower 内部 pool)
-                # 但 input_ids 需要知道最终每帧多少 token
-                # Gemma4 base forward 自己处理, 每帧 pooler_output = 264
-                tpi = 264  # Gemma4 VisionPooler 输出, 720x404 → 264 tokens
+                tpi = 264
             input_ids, labels = self._build_token_sequence(
-                inst["context"], inst["frame_timestamps"], tpi, inst["gt_text"]
+                inst["context"], n_frames, tpi, inst["gt_text"]
             )
             result = {"input_ids": input_ids, "labels": labels, "pixel_values": pixel_values, "mode": "online"}
             if position_ids is not None:

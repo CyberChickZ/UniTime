@@ -53,9 +53,9 @@ def parse_args():
 # ============================================================
 # 文本构造 (和 collator 一致, 但不含 GT)
 # ============================================================
-def build_prompt(tokenizer, config, context, timestamps, feature_chunk,
+def build_prompt(tokenizer, config, context, n_frames, feature_chunk,
                  spatial_pool_grid, device):
-    """构造推理 prompt, 返回 input_ids + feature_inputs (已 pool)."""
+    """构造推理 prompt (不加时间戳), 返回 input_ids + feature_inputs (已 pool)."""
     bos = tokenizer.bos_token or ""
     boi_id = config.boi_token_id
     eoi_id = config.eoi_token_id
@@ -66,8 +66,6 @@ def build_prompt(tokenizer, config, context, timestamps, feature_chunk,
     def tok(text):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    newline_ids = tok("\n\n")
-
     if context:
         context_str = ", ".join(context)
         header = tok(f"{bos}<|turn>user\nPrevious actions: {context_str}\n")
@@ -75,15 +73,12 @@ def build_prompt(tokenizer, config, context, timestamps, feature_chunk,
         header = tok(f"{bos}<|turn>user\n")
 
     body = []
-    for t in timestamps:
-        body.extend(tok(f"{t}s "))
-        body.extend(newline_ids)
+    for _ in range(n_frames):
         body.append(boi_id)
         body.extend([img_tok] * tpi)
         body.append(eoi_id)
-        body.extend(newline_ids)
 
-    instr = tok("List all action segments with start and end timestamps.\n")
+    instr = tok("\nList all action segments with start and end timestamps.\n")
     turn = tok("<turn|>\n<|turn>model\n")
 
     input_ids = header + body + instr + turn
@@ -91,7 +86,6 @@ def build_prompt(tokenizer, config, context, timestamps, feature_chunk,
     attn = torch.ones_like(input_ids)
 
     # Spatial pooling on CPU
-    n_frames = feature_chunk.shape[0]
     raw_tpi = feature_chunk.shape[1]
     D = feature_chunk.shape[2]
     src_h, src_w = 1, raw_tpi
@@ -111,22 +105,38 @@ def build_prompt(tokenizer, config, context, timestamps, feature_chunk,
 # Parse model 输出
 # ============================================================
 def parse_prediction(text):
-    """Parse COIN 格式预测文本 → list of (label, start, end).
-    输入示例: "take 0.0 1.7, open 2.3 6.0, pour 7.0 12.3"
+    """Parse 模型输出 → list of (label, start, end).
+    支持 JSON 格式: [{"start": 0.0, "end": 0.4, "action": "open"}, ...]
+    也兼容 COIN 格式: "take 0.0 1.7, open 2.3 6.0"
     """
+    text = text.strip()
+    # 尝试 JSON parse
+    try:
+        # 找到第一个 [ 和最后一个 ]
+        start_idx = text.find("[")
+        end_idx = text.rfind("]")
+        if start_idx >= 0 and end_idx > start_idx:
+            data = json.loads(text[start_idx:end_idx + 1])
+            segments = []
+            for item in data:
+                if isinstance(item, dict) and "start" in item and "end" in item:
+                    label = item.get("action") or item.get("label") or "unknown"
+                    segments.append({"label": label, "start": float(item["start"]), "end": float(item["end"])})
+            return segments
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Fallback: COIN 格式
     segments = []
-    parts = text.strip().rstrip(".").split(",")
+    parts = text.rstrip(".").split(",")
     for part in parts:
         part = part.strip()
         if not part or part == "none":
             continue
         tokens = part.split()
         if len(tokens) >= 3:
-            label = tokens[0]
             try:
-                start = float(tokens[1])
-                end = float(tokens[2])
-                segments.append({"label": label, "start": start, "end": end})
+                segments.append({"label": tokens[0], "start": float(tokens[1]), "end": float(tokens[2])})
             except ValueError:
                 continue
     return segments
@@ -313,15 +323,12 @@ def main():
                 continue
             sample_indices = [w_start_frame + i * STEP for i in range(n_sample)]
 
-            # 相对时间戳
-            timestamps = [round(i * STEP / ORIGINAL_FPS, 1) for i in range(n_sample)]
-
             # Feature 切片
             feature_chunk = feature[sample_indices]  # [n_sample, 264, 2560]
 
-            # 构造 prompt (无 GT)
+            # 构造 prompt (无 GT, 无时间戳)
             input_ids, attn, feat_inputs = build_prompt(
-                tokenizer, config, context, timestamps, feature_chunk,
+                tokenizer, config, context, n_sample, feature_chunk,
                 spatial_pool_grid, device,
             )
 

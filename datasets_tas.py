@@ -125,11 +125,13 @@ class GTEAWindowDataset(Dataset):
             t_end = round(seg["end_offset"] / self.ORIGINAL_FPS, 1)
             gt_segments.append({"label": seg["label"], "start": t_start, "end": t_end})
 
-        gt_text = ", ".join(
-            f"{seg['label']} {seg['start']} {seg['end']}" for seg in gt_segments
-        )
-        if not gt_text:
-            gt_text = "none"
+        import json
+        if gt_segments:
+            gt_text = json.dumps(
+                [{"start": seg["start"], "end": seg["end"], "action": seg["label"]} for seg in gt_segments]
+            )
+        else:
+            gt_text = "[]"
 
         # Step 6: 前文 context — 窗口前的 action 序列, 去 background, 去重连续
         context_indices = list(range(0, s_frame, self.STEP))
