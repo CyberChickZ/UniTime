@@ -54,11 +54,28 @@ class Gemma4TASDataCollator(BaseDataCollator):
 
     def _load_features(self, feat_path: str, sample_indices: List[int]) -> torch.Tensor:
         """从 .pt 加载预提取 features, 按 sample_indices 切片.
-        返回 [n_frames, 2520, D] (不做 spatial pooling, 留给模型 forward).
+        如果设置了 spatial_pool_grid, 在 CPU 上做 bilinear pooling.
+        返回 [n_frames, tpi, D] (tpi = pool 后的 tokens per image).
         """
         data = torch.load(feat_path, map_location="cpu", weights_only=False)
-        feature = data["feature"]  # [T_total, 2520, D]
-        return feature[sample_indices]  # [90, 2520, D]
+        feature = data["feature"]  # [T_total, raw_tpi, D]
+        sliced = feature[sample_indices]  # [n_frames, raw_tpi, D]
+
+        if self.spatial_pool_grid is not None:
+            import torch.nn.functional as Fn
+            import math
+            tgt_h, tgt_w = self.spatial_pool_grid
+            n, raw_tpi, D = sliced.shape
+            # 找 raw_tpi 的最接近正方形的因数分解
+            src_h, src_w = 1, raw_tpi
+            for i in range(2, int(math.sqrt(raw_tpi)) + 1):
+                if raw_tpi % i == 0:
+                    src_h, src_w = i, raw_tpi // i
+            sliced = sliced.reshape(n, src_h, src_w, D).permute(0, 3, 1, 2).float()
+            sliced = Fn.interpolate(sliced, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+            sliced = sliced.permute(0, 2, 3, 1).reshape(n, tgt_h * tgt_w, D).to(feature.dtype)
+
+        return sliced
 
     def _process_single(self, inst: Dict):
         """处理单条数据: 加载 features → 构造 input_ids + labels."""

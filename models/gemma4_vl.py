@@ -111,67 +111,44 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
         # the embedding lookup when input_ids=None, causing an O(seq×vocab×hidden)
         # OOM. We must compute PLE from input_ids BEFORE scattering features.
         if feature_inputs is not None:
+            # Cached-features path: features 已 spatial pooling (collator 做的).
+            # scatter 到 inputs_embeds 后, 手动算 PLE, 然后走 peft-wrapped LLM.
             if input_ids is None:
-                raise ValueError(
-                    "feature_inputs path requires input_ids (to locate image_token "
-                    "positions for masked_scatter)."
-                )
+                raise ValueError("feature_inputs path requires input_ids.")
             image_token_id = self.config.image_token_id
             pad_token_id = self.config.text_config.pad_token_id
             image_mask_1d = (input_ids == image_token_id)
 
-            # Spatial pooling: 在 scatter 之前对 feature_inputs 做 pool
-            features = feature_inputs.to(
-                self.get_input_embeddings().weight.device,
-                self.get_input_embeddings().weight.dtype,
-            )
-            if self.spatial_pool_grid is not None:
-                tgt_h, tgt_w = self.spatial_pool_grid
-                D = features.shape[-1]
-                # 从 input_ids 中的 image token 数和 pool 后 tpi 推算原始每帧 token 数
-                n_img_slots = image_mask_1d.sum().item()
-                tpi_pool = tgt_h * tgt_w
-                n_images = n_img_slots // tpi_pool
-                raw_tpi = features.shape[0] // n_images
-                chunks = features.reshape(n_images, raw_tpi, D)
-                src_h, src_w = _find_hw(raw_tpi)
-                chunks = chunks.reshape(n_images, src_h, src_w, D).permute(0, 3, 1, 2)
-                pooled = F.interpolate(chunks, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
-                features = pooled.permute(0, 2, 3, 1).reshape(n_images * tgt_h * tgt_w, D)
-
-            # 1) Replace image tokens with PAD for clean embedding + PLE
+            # 1) Embedding (用 PAD 替换 image tokens)
             llm_input_ids = input_ids.clone()
             llm_input_ids[image_mask_1d] = pad_token_id
             inputs_embeds_local = self.get_input_embeddings()(llm_input_ids)
 
-            # 2) Compute PLE
-            lm = self._mm_model.language_model if self._mm_model else self.model.language_model
+            # 2) PLE (Per-Layer Embeddings) — 从 PAD-replaced input_ids 算
+            mm = self._mm_model if self._mm_model else self.model
+            lm_raw = mm.language_model  # 原始 Gemma4TextModel (不经过 peft)
             per_layer_inputs = None
-            if getattr(lm, "hidden_size_per_layer_input", 0):
-                per_layer_inputs = lm.get_per_layer_inputs(llm_input_ids, inputs_embeds_local)
-                per_layer_inputs = lm.project_per_layer_inputs(inputs_embeds_local, per_layer_inputs)
+            if getattr(lm_raw, "hidden_size_per_layer_input", 0):
+                per_layer_inputs = lm_raw.get_per_layer_inputs(llm_input_ids, inputs_embeds_local)
+                per_layer_inputs = lm_raw.project_per_layer_inputs(inputs_embeds_local, per_layer_inputs)
 
-            # 3) Scatter features into the embedding
+            # 3) Scatter features
+            features = feature_inputs.to(inputs_embeds_local.device, inputs_embeds_local.dtype)
             image_mask = image_mask_1d.unsqueeze(-1).expand_as(inputs_embeds_local)
             if inputs_embeds_local[image_mask].numel() != features.numel():
                 n_img = image_mask_1d.sum().item()
                 raise ValueError(
-                    f"feature_inputs numel ({features.numel()}) != image-token slots "
-                    f"({n_img} tokens × {inputs_embeds_local.shape[-1]} dim)."
+                    f"feature numel ({features.numel()}) != slots "
+                    f"({n_img} × {inputs_embeds_local.shape[-1]})"
                 )
             inputs_embeds_local = inputs_embeds_local.masked_scatter(image_mask, features)
 
-            attn_mask_to_pass = (
-                attention_mask_multiqa.to(inputs_embeds_local.device, inputs_embeds_local.dtype)
-                if (attention_mask_multiqa is not None and multi_qa)
-                else attention_mask
-            )
-
-            # 4) Call LLM directly (绕过 MultiModalModel)
-            lm_out = lm(
+            # 4) LLM forward — 通过 peft 包装后的 language_model (LoRA 生效)
+            #    peft 包装后, self.model 内部的 language_model 已经有 LoRA layers
+            lm_out = lm_raw(
                 input_ids=None,
                 inputs_embeds=inputs_embeds_local,
-                attention_mask=attn_mask_to_pass,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 per_layer_inputs=per_layer_inputs,
@@ -180,7 +157,7 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
             )
             hidden_states = lm_out.last_hidden_state
 
-            # 5) Sparse loss: 只在 labels != -100 的 GT 部分算 logits
+            # 5) Sparse loss: 只在 GT 部分算 logits
             loss = None
             if labels is not None:
                 n_gt = (labels[0] != -100).sum().item()
