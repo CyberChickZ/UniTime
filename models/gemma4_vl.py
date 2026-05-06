@@ -40,16 +40,24 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
     """Gemma4-VL with UniTime additions: cached features + multi-qa mask + spatial pooling."""
 
     spatial_pool_grid: Optional[Tuple[int, int]] = None
+    _mm_model = None  # 保存 Gemma4MultiModalModel 的直接引用, 绕过 peft 劫持
 
     def set_spatial_pool(self, grid: Optional[Tuple[int, int]]):
         """Set spatial pooling target grid. None = no pooling (default).
 
         Patches Gemma4Model.get_image_features so pooling happens inside
         self.model.forward() where the base class calls it.
+        必须在 peft 包装之后调用 (peft 会劫持 self.model).
         """
         self.spatial_pool_grid = grid
+        # 找到真正的 Gemma4MultiModalModel, 不管是否被 peft 包装
+        mm = self.model
+        while hasattr(mm, 'model') and not hasattr(mm, 'vision_tower'):
+            mm = mm.model
+        self._mm_model = mm
+
         if grid is not None:
-            _original = self.model.get_image_features.__func__
+            _original = mm.get_image_features.__func__
             _self_ref = self
 
             def _patched_get_image_features(model_self, pixel_values, image_position_ids=None, **kwargs):
@@ -174,11 +182,12 @@ class Gemma4VLMRForConditionalGeneration(Gemma4ForConditionalGeneration):
                 past_key_values=lm_out.past_key_values,
             )
 
-        # Pixel-values path: 走 self.model() 做 vision + LLM forward，
+        # Pixel-values path: 走 _mm_model (Gemma4MultiModalModel) 做 vision + LLM forward，
         # 但不用 base class 的 loss（它对整个 seq_len 算 logits 会 OOM）。
         # 只对 labels != -100 的 GT 部分算 lm_head + cross-entropy。
-        if labels is not None and pixel_values is not None:
-            outputs = self.model(
+        # 用 _mm_model 直接引用原始 model, 绕过 peft 对 self.model 的劫持。
+        if labels is not None and pixel_values is not None and self._mm_model is not None:
+            outputs = self._mm_model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
